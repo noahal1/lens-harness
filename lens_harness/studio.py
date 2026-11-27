@@ -40,6 +40,7 @@ NODE_TYPES = ("llm", "tool_loop", "interrupt", "python",
 _TEMPLATES: dict[str, dict[str, Any]] = {
     "sequential": {
         "desc": "流水线：数据从入口节点一路改写到最后，最简单的入门模板",
+        "desc_en": "Pipeline: data flows from the entry node through template rewrites to the end — the simplest starter.",
         "input": {"x": "hello"},
         "name": "studio-flow",
         "state": {"x": "str", "out": "str"},
@@ -49,6 +50,7 @@ _TEMPLATES: dict[str, dict[str, Any]] = {
     },
     "llm_tool_loop": {
         "desc": "会算数的 agent：模型想用计算器就调工具，拿到结果继续想，直到给出最终答案",
+        "desc_en": "A computing agent: the model calls the calculator tool when it wants, keeps reasoning, then gives a final answer.",
         "input": {"question": "17*23"},
         "llm": {"replies": ["Let me compute that. TOOL: calculator | 17*23",
                             "FINAL: computed."]},
@@ -67,6 +69,7 @@ _TEMPLATES: dict[str, dict[str, Any]] = {
     },
     "approval": {
         "desc": "人工审批：跑到关键步骤会暂停等你在界面上确认，批准后才继续执行",
+        "desc_en": "Human approval: the run pauses at the gate until you approve in the UI, then continues.",
         "input": {"action": "delete prod db"},
         "name": "studio-approval",
         "state": {"action": "str", "decision": "str", "log": ["list[str]", "add"]},
@@ -146,7 +149,8 @@ class StudioSession:
 
     def _cmd_templates(self, payload: dict) -> dict:
         """List the built-in templates with descriptions — for the UI buttons."""
-        listing = {name: {"desc": t.get("desc", ""), "input": t.get("input", {})}
+        listing = {name: {"desc": t.get("desc", ""), "desc_en": t.get("desc_en", ""),
+                          "input": t.get("input", {})}
                    for name, t in _TEMPLATES.items()}
         return {"ok": True, "templates": listing, "spec": self.spec,
                 "runs": self.runs}

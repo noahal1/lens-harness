@@ -80,20 +80,20 @@ button.run:focus-visible{outline:2px solid var(--accent2);outline-offset:1px}
 <header>
   <div class="dot"></div>
   <h1>lens studio</h1>
-  <span class="chip" id="chipSpec">未创建</span>
-  <span class="chip" id="chipRuns">0 次运行</span>
-  <a href="/">只读 lens →</a>
+  <span class="chip" id="chipSpec"></span>
+  <span class="chip" id="chipRuns"></span>
+  <a href="/" id="lensHome"></a> · <a href="#" id="langLink"></a>
 </header>
 <main>
   <div id="left">
     <div id="chat"></div>
     <div id="toolbar">
-      <div class="trow" id="tplRow"><span class="lbl">① 选模板</span></div>
-      <div class="trow"><span class="lbl">② 输入</span>
+      <div class="trow" id="tplRow"><span class="lbl lblRow1">① 选模板</span></div>
+      <div class="trow"><span class="lbl lblRow2">② 输入</span>
         <input id="quickInput" placeholder="运行输入（可留空用默认）" spellcheck="false">
         <button class="act primary" id="quickRun">▶ 运行</button>
       </div>
-      <div class="trow"><span class="lbl">③ 查看</span>
+      <div class="trow"><span class="lbl lblRow3">③ 查看</span>
         <button class="act" id="quickSpec">看当前编排 JSON</button>
         <button class="act" id="quickHelp">怎么玩？</button>
       </div>
@@ -108,7 +108,7 @@ button.run:focus-visible{outline:2px solid var(--accent2);outline-offset:1px}
   </div>
   <div id="right">
     <div class="bar">
-      <span id="lensLabel">lens — 最近一次运行</span>
+      <span id="lensLabel"></span>
       <span id="lensTrace"></span>
     </div>
     <iframe id="lens" title="lens trace view"></iframe>
@@ -119,8 +119,42 @@ button.run:focus-visible{outline:2px solid var(--accent2);outline-offset:1px}
 const chat = document.getElementById("chat");
 const lensFrame = document.getElementById("lens");
 
-const HELP =
-`三步上手：
+/* bilingual chrome — same localStorage key as the lens page, so the
+   language choice is shared across / and /studio */
+const I18N = {
+  en: {
+    noSpec: "no spec", runs: " runs", nodes: " nodes",
+    lensBar: "lens — latest run", lensLabel: "read-only lens →",
+    step1: "① pick template", step2: "② input", step3: "③ inspect",
+    inputPh: "run input (empty = template default)", runBtn: "▶ Run",
+    specBtn: "view current spec JSON", helpBtn: "how does this work?",
+    adv: "advanced: send raw JSON commands (edit nodes / edges / delete…)",
+    send: "Send", invalid: "✗ not valid JSON: ",
+    requestFailed: "✗ request failed: ",
+    welcome: "Welcome to lens studio! **Three steps** to your first run — start with a template button below.\n",
+    help: `Three steps:
+① Click a template button under "pick template" (hover for a description)
+② Fill the run input (leave empty for the default), press "▶ Run"
+③ The lens on the right replays the run live: nodes light up while executing,
+   the state panel shows how every channel evolves.
+
+Want to edit the orchestration? Expand "advanced" and send JSON commands, e.g.:
+{"cmd":"add_node","name":"n1","node":{"type":"transform","set":{"out":"hi {x}"}}}
+{"cmd":"set_edge","from":"a","to":"n1"}   {"cmd":"set_entry","entry":"n1"}
+7 node types: llm (model call) · tool_loop (tool loop) · interrupt (human approval)
+· python (custom function) · transform (template rewrite) · map (per-item list) · subgraph (nested spec)`,
+  },
+  zh: {
+    noSpec: "未创建", runs: " 次运行", nodes: " 节点",
+    lensBar: "lens — 最近一次运行", lensLabel: "只读 lens →",
+    step1: "① 选模板", step2: "② 输入", step3: "③ 查看",
+    inputPh: "运行输入（可留空用默认）", runBtn: "▶ 运行",
+    specBtn: "看当前编排 JSON", helpBtn: "怎么玩？",
+    adv: "高级：直接发 JSON 命令（改节点 / 改边 / 删除…）",
+    send: "发送", invalid: "✗ 不是合法 JSON：",
+    requestFailed: "✗ 请求失败：",
+    welcome: "欢迎来到 lens studio！**三步**就能跑起来，点下面的模板按钮开始。\n",
+    help: `三步上手：
 ① 点「选模板」里的一个按钮创建编排（鼠标停在按钮上有说明）
 ② 输入框填运行输入（留空就用模板默认值），点「▶ 运行」
 ③ 右边 lens 实时播放这次运行：图上节点亮起表示正在执行，
@@ -130,7 +164,35 @@ const HELP =
 {"cmd":"add_node","name":"n1","node":{"type":"transform","set":{"out":"hi {x}"}}}
 {"cmd":"set_edge","from":"a","to":"n1"}   {"cmd":"set_entry","entry":"n1"}
 节点类型 7 种：llm（模型调用）· tool_loop（工具循环）· interrupt（人工审批）
-· python（自定义函数）· transform（模板改写）· map（逐项处理列表）· subgraph（嵌套子编排）`;
+· python（自定义函数）· transform（模板改写）· map（逐项处理列表）· subgraph（嵌套子编排）`,
+  },
+};
+function lang() {
+  try { return localStorage.getItem("lens-lang") || "zh"; } catch (e) { return "zh"; }
+}
+function T(key) { return I18N[lang()][key]; }
+let LANG_BTN = null;  // set by applyStatic, re-created on toggle
+function applyStatic() {
+  document.documentElement.lang = lang() === "zh" ? "zh" : "en";
+  document.title = lang() === "zh" ? "lens studio — 可视化编排工作台" : "lens studio — visual orchestration workbench";
+  document.querySelector(".lblRow1").textContent = T("step1");
+  document.querySelector(".lblRow2").textContent = T("step2");
+  document.querySelector(".lblRow3").textContent = T("step3");
+  document.getElementById("quickInput").placeholder = T("inputPh");
+  document.getElementById("quickRun").textContent = T("runBtn");
+  document.getElementById("quickSpec").textContent = T("specBtn");
+  document.getElementById("quickHelp").textContent = T("helpBtn");
+  document.querySelector("details.raw summary").textContent = T("adv");
+  document.getElementById("send").textContent = T("send");
+  document.getElementById("lensLabel").textContent = T("lensBar");
+  document.getElementById("lensHome").textContent = T("lensLabel");
+  document.getElementById("langLink").textContent = lang() === "zh" ? "English" : "中文";
+  document.getElementById("langLink").onclick = () => {
+    try { localStorage.setItem("lens-lang", lang() === "zh" ? "en" : "zh"); } catch (e) {}
+    applyStatic();
+  };
+  refreshChips({spec: curSpec, runs: curRuns});
+}
 
 function add(role, text, extra) {
   const div = document.createElement("div");
@@ -156,11 +218,13 @@ function add(role, text, extra) {
   chat.scrollTop = chat.scrollHeight;
 }
 
+let curSpec = null, curRuns = [];
 function refreshChips(res) {
+  if (res) { curSpec = res.spec; curRuns = res.runs || []; }
   document.getElementById("chipSpec").textContent =
-    res.spec ? res.spec.name + " · " + Object.keys(res.spec.nodes).length + " 节点" : "未创建";
+    res.spec ? res.spec.name + " · " + Object.keys(res.spec.nodes).length + T("nodes") : T("noSpec");
   document.getElementById("chipRuns").textContent =
-    (res.runs ? res.runs.length : 0) + " 次运行";
+    (res.runs ? res.runs.length : 0) + T("runs");
 }
 
 let lastTrace = null;
@@ -186,7 +250,7 @@ async function sendRaw(lines) {
     let payload;
     try { payload = JSON.parse(line); }
     catch (e) {
-      add("assistant", "✗ 不是合法 JSON：" + e.message + "\n" + HELP, {error: true});
+      add("assistant", T("invalid") + e.message + "\n" + T("help"), {error: true});
       continue;
     }
     add("user", line);
@@ -196,7 +260,7 @@ async function sendRaw(lines) {
       refreshChips(res);
       maybeLoadLens(res);
     } catch (e) {
-      add("assistant", "✗ 请求失败：" + e.message, {error: true});
+      add("assistant", T("requestFailed") + e.message, {error: true});
     }
   }
 }
@@ -210,7 +274,8 @@ async function buildTemplateButtons() {
       const b = document.createElement("button");
       b.className = "act";
       b.textContent = name;
-      b.title = t.desc + "\n默认输入: " + JSON.stringify(t.input);
+      b.title = (lang() === "zh" ? t.desc : (t.desc_en || t.desc))
+        + "\n" + (lang() === "zh" ? "默认输入: " : "default input: ") + JSON.stringify(t.input);
       b.addEventListener("click", () => {
         document.getElementById("quickInput").value =
           t.input ? JSON.stringify(t.input) : "";
@@ -232,7 +297,7 @@ document.getElementById("quickRun").addEventListener("click", () => {
 document.getElementById("quickSpec").addEventListener("click",
   () => sendRaw(['{"cmd":"get_spec"}']));
 document.getElementById("quickHelp").addEventListener("click",
-  () => add("assistant", HELP));
+  () => add("assistant", T("help")));
 
 /* ---- raw form ---- */
 document.getElementById("f").addEventListener("submit", e => {
@@ -243,8 +308,10 @@ document.getElementById("f").addEventListener("submit", e => {
   sendRaw(lines);
 });
 
-add("assistant", "欢迎来到 lens studio！**三步**就能跑起来，点下面的模板按钮开始。\n" + HELP);
+applyStatic();
+add("assistant", T("welcome") + T("help"));
 buildTemplateButtons();
+document.getElementById("lensHome").textContent = T("lensLabel");
 </script>
 </body>
 </html>
