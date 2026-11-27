@@ -8,10 +8,11 @@
   /* Same design language as index.html: one palette, one radius scale,
      mono-first. Pure consumer of /api/diff — only the paint changed. */
   :root {
-    --bg: #0b0e13; --panel: #11151c; --panel-2: #151b24; --line: #1f2833; --line-2: #2b3644;
-    --fg: #dbe3ec; --dim: #6b7889;
-    --same: #3a4152; --changed: #e0a83c; --onlya: #e8695f; --onlyb: #6aa8e0;
-    --accent: #57c7b0; --green: #7dc47f;
+    /* light workbench palette, shared with the lens pages */
+    --bg: #f6f7f9; --panel: #ffffff; --panel-2: #fbfcfd; --line: #e2e6eb; --line-2: #c9d0d8;
+    --fg: #1d2733; --dim: #5b6a7a;
+    --same: #c9d0d8; --changed: #b57817; --onlya: #c0443c; --onlyb: #2f6fab;
+    --accent: #0e7c6b; --green: #3d8f52;
     --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
   }
   * { box-sizing: border-box; }
@@ -26,8 +27,8 @@
   header {
     padding: 10px 16px; border-bottom: 1px solid var(--line);
     display: flex; gap: 18px; align-items: baseline; flex-wrap: wrap;
-    background: linear-gradient(180deg, #12171f, #0e131a);
-    box-shadow: 0 1px 8px rgba(0,0,0,.25);
+    background: var(--panel);
+    box-shadow: 0 1px 3px rgba(29,39,51,.08);
     position: relative; z-index: 2;
   }
   header h1 {
@@ -36,8 +37,8 @@
   header h1::before {
     content: ""; display: inline-block; width: 9px; height: 9px; margin-right: 9px;
     border-radius: 50%; vertical-align: 1px;
-    background: radial-gradient(circle at 35% 30%, #9ff0df, var(--accent) 55%, #1d5a50);
-    box-shadow: 0 0 10px rgba(87,199,176,.55);
+    background: var(--accent);
+    box-shadow: none;
   }
   header .meta { color: var(--dim); }
   #counts { display: flex; gap: 14px; margin-left: auto; }
@@ -49,7 +50,7 @@
   main { padding: 14px 16px 40px; max-width: 1100px; }
   .identical {
     color: var(--green); padding: 28px 16px; font-size: 15px;
-    border: 1px solid #2f4a44; border-radius: 10px; background: rgba(87,199,176,.05);
+    border: 1px solid #9ccfc4; border-radius: 10px; background: #eef7f5;
   }
   section { margin: 0 0 26px; }
   section h2 {
@@ -74,14 +75,14 @@
   .entry .fields { color: var(--dim); margin-left: auto; font-size: 11px; }
   .pair { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 6px; }
   .pair .side {
-    background: #0d1218; border: 1px solid var(--line); padding: 7px 9px;
+    background: var(--panel-2); border: 1px solid var(--line); padding: 7px 9px;
     white-space: pre-wrap; word-break: break-all; border-radius: 6px; min-width: 0;
   }
-  .pair .side:first-child { color: #c9a3a0; }
-  .pair .side:last-child  { color: #a2bda9; }
+  .pair .side:first-child { color: var(--onlya); }
+  .pair .side:last-child  { color: var(--green); }
   .pair .tag { color: var(--dim); font-size: 11px; margin-bottom: 2px; letter-spacing: .1em; text-transform: uppercase; }
   .single {
-    background: #0d1218; border: 1px solid var(--line); padding: 7px 9px; margin-top: 6px;
+    background: var(--panel-2); border: 1px solid var(--line); padding: 7px 9px; margin-top: 6px;
     white-space: pre-wrap; word-break: break-all; border-radius: 6px; color: var(--dim);
   }
   .error { color: var(--onlya); padding: 24px 4px; }
