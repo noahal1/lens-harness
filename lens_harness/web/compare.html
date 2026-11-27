@@ -1,0 +1,137 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>lens · trace diff</title>
+<style>
+  :root {
+    --bg: #12151c; --panel: #1a1f2a; --line: #2a3140;
+    --fg: #d6dbe4; --dim: #6d7686;
+    --same: #3a4152; --changed: #e5a54b; --onlya: #d16a6a; --onlyb: #6aa7d1;
+    --green: #7dc47f; --mono: ui-monospace, "Cascadia Mono", Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--fg);
+    font-family: var(--mono); font-size: 13px; line-height: 1.5;
+  }
+  header {
+    padding: 10px 16px; border-bottom: 1px solid var(--line);
+    display: flex; gap: 18px; align-items: baseline; flex-wrap: wrap;
+  }
+  header h1 { font-size: 14px; margin: 0; }
+  header .meta { color: var(--dim); }
+  #counts { display: flex; gap: 14px; margin-left: auto; }
+  #counts span b { font-size: 15px; }
+  main { padding: 12px 16px 40px; }
+  .identical {
+    color: var(--green); padding: 24px 0; font-size: 15px;
+  }
+  section { margin: 0 0 26px; }
+  section h2 {
+    font-size: 12px; text-transform: uppercase; letter-spacing: .08em;
+    color: var(--dim); border-bottom: 1px solid var(--line);
+    padding-bottom: 6px; margin: 0 0 10px;
+  }
+  .entry { padding: 6px 10px; border-left: 3px solid var(--same); margin: 0 0 10px; background: var(--panel); }
+  .entry.changed  { border-left-color: var(--changed); }
+  .entry.only_a   { border-left-color: var(--onlya); }
+  .entry.only_b   { border-left-color: var(--onlyb); }
+  .entry .head { display: flex; gap: 10px; }
+  .entry .kind { color: var(--changed); font-weight: bold; }
+  .entry.only_a .kind, .entry.only_b .kind { color: var(--fg); }
+  .entry .key { color: var(--dim); }
+  .entry .fields { color: var(--dim); margin-left: auto; }
+  .pair { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 6px; }
+  .pair .side { background: #10131a; padding: 6px 8px; white-space: pre-wrap; word-break: break-all; }
+  .pair .tag { color: var(--dim); font-size: 11px; margin-bottom: 2px; }
+  .single { background: #10131a; padding: 6px 8px; margin-top: 6px; white-space: pre-wrap; word-break: break-all; }
+  .error { color: var(--onlya); padding: 20px 0; }
+</style>
+</head>
+<body>
+<header>
+  <h1>lens · trace diff</h1>
+  <span class="meta" id="meta">loading…</span>
+  <div id="counts">
+    <span class="meta">same <b id="c-same">–</b></span>
+    <span style="color:var(--changed)">changed <b id="c-changed">–</b></span>
+    <span style="color:var(--onlya)">only-a <b id="c-onlya">–</b></span>
+    <span style="color:var(--onlyb)">only-b <b id="c-onlyb">–</b></span>
+  </div>
+</header>
+<main id="main"><div class="meta">…</div></main>
+
+<script>
+/* The M3 browser lens. Like index.html it is a pure consumer of server data:
+   one GET to /api/diff, one paint. It imports nothing from the kernel and
+   computes nothing itself — the comparison was made by compare.py, and this
+   page only renders the verdict. Pure function + painter, same as M2:
+   render(data) returns the DOM; no global mutable state beyond the fetch. */
+
+function esc(text) {
+  var d = document.createElement("div");
+  d.textContent = text === null || text === undefined ? "" : String(text);
+  return d.innerHTML;
+}
+
+function fmt(value) {
+  if (value === undefined) return "(missing)";
+  try { return JSON.stringify(value, null, 1); } catch (e) { return String(value); }
+}
+
+function keyLabel(key) { return key.slice(1).join(" ") || "-"; }
+
+function entryHTML(e) {
+  var head = '<div class="head"><span class="kind">' + esc(e.kind) + "</span>"
+    + '<span class="key">' + esc(keyLabel(e.key)) + "</span>";
+  if (e.changed_fields && e.changed_fields.length) {
+    head += '<span class="fields">' + esc(e.changed_fields.join(", ")) + "</span>";
+  }
+  head += "</div>";
+  if (e.status === "changed") {
+    return '<div class="entry changed">' + head
+      + '<div class="pair"><div class="side"><div class="tag">a</div>' + esc(fmt(e.a[e.changed_fields[0]])) + "</div>"
+      + '<div class="side"><div class="tag">b</div>' + esc(fmt(e.b[e.changed_fields[0]])) + "</div></div></div>";
+  }
+  var solo = e.status === "only_a" ? e.a : e.b;
+  return '<div class="entry ' + e.status + '">' + head
+    + '<div class="single">' + esc(fmt(solo)) + "</div></div>";
+}
+
+function render(data) {
+  var main = document.getElementById("main");
+  if (data.identical) {
+    main.innerHTML = '<div class="identical">■ identical — every behavioral field matches after normalization</div>';
+    return;
+  }
+  var changed = data.entries.filter(function (e) { return e.status === "changed"; });
+  var onlyA  = data.entries.filter(function (e) { return e.status === "only_a"; });
+  var onlyB  = data.entries.filter(function (e) { return e.status === "only_b"; });
+  var html = "";
+  if (changed.length) {
+    html += '<section><h2>changed</h2>' + changed.map(entryHTML).join("") + "</section>";
+  }
+  if (onlyA.length) {
+    html += '<section><h2>only in a · ' + esc(data.a.trace) + "</h2>" + onlyA.map(entryHTML).join("") + "</section>";
+  }
+  if (onlyB.length) {
+    html += '<section><h2>only in b · ' + esc(data.b.trace) + "</h2>" + onlyB.map(entryHTML).join("") + "</section>";
+  }
+  main.innerHTML = html;
+}
+
+fetch("/api/diff").then(function (r) { return r.json(); }).then(function (data) {
+  document.getElementById("meta").textContent =
+    "a: " + data.a.trace + " (" + data.a.records + " records)   b: " + data.b.trace + " (" + data.b.records + " records)";
+  document.getElementById("c-same").textContent = data.entries.filter(function (e) { return e.status === "same"; }).length;
+  document.getElementById("c-changed").textContent = data.entries.filter(function (e) { return e.status === "changed"; }).length;
+  document.getElementById("c-onlya").textContent = data.entries.filter(function (e) { return e.status === "only_a"; }).length;
+  document.getElementById("c-onlyb").textContent = data.entries.filter(function (e) { return e.status === "only_b"; }).length;
+  render(data);
+}).catch(function (err) {
+  document.getElementById("main").innerHTML = '<div class="error">failed to load /api/diff: ' + esc(err) + "</div>";
+});
+</script>
+</body>
+</html>

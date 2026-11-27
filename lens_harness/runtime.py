@@ -19,6 +19,7 @@ parallel fan-out safe and time travel possible.
 from __future__ import annotations
 
 import traceback
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any, Callable
@@ -32,6 +33,7 @@ from .checkpoint import (
 )
 from .events import (
     CHECKPOINT_CREATED,
+    ERROR_REPORTED,
     INTERRUPT,
     NODE_END,
     NODE_ERROR,
@@ -106,7 +108,13 @@ class Runtime:
     ) -> RunResult:
         cfg = config or RunConfig()
         state = self.compiled.new_state(inputs)
+        # A fresh run_id (and a reset seq) per invoke: sharing one emitter
+        # across runs made a second invoke continue the first run's seq and
+        # reuse its run_id — two runs interleaved in one trace (§11.11).
+        self.emitter.run_id = f"r_{uuid.uuid4().hex[:8]}"
+        self.emitter.reset_seq()
         self.emitter.thread_id = cfg.thread_id
+        self.emitter.superstep = -1
         run_id = self.emitter.run_id
 
         self.emitter.emit(
@@ -143,6 +151,21 @@ class Runtime:
         checkpoint = self.store.load(checkpoint_id)
         if checkpoint is None:
             raise FileNotFoundError(f"no such checkpoint: {checkpoint_id}")
+
+        # A resumed trace must be self-describing: without a ``run_start`` the
+        # graph snapshot is missing and a lens reading this trace alone cannot
+        # draw the graph (DESIGN.md §11.3). Same event as ``invoke``, plus a
+        # ``resumed_from`` marker so renderers can label it as a continuation.
+        self.emitter.run_id = checkpoint.run_id
+        self.emitter.thread_id = checkpoint.thread_id
+        self.emitter.superstep = -1
+        self.emitter.emit(
+            RUN_START,
+            graph=self.compiled.graph.snapshot(),
+            inputs=summarize_state(checkpoint.state),
+            config={"thread_id": checkpoint.thread_id, "max_supersteps": cfg.max_supersteps},
+            resumed_from=checkpoint_id,
+        )
 
         state = self.compiled.new_state(checkpoint.state)
         # An interrupt is a one-shot signal, but it lives in the state that was
@@ -244,6 +267,7 @@ class Runtime:
                 next_active = self._merge_and_route(
                     state=state, before=before, writes=writes, plan=plan
                 )
+                self._emit_reported_errors(plan, writes, state)
 
                 interrupted = self._interrupt_payload(state)
                 parent = self._commit(
@@ -444,6 +468,34 @@ class Runtime:
                 )
             nxt.extend(t for t in targets if t != END)
         return list(dict.fromkeys(nxt))
+
+    def _emit_reported_errors(
+        self,
+        plan: list[str],
+        writes: list[tuple[str, dict[str, Any] | None]],
+        state: State,
+    ) -> None:
+        """Give ``__error__`` a consumer (DESIGN.md §11.9).
+
+        A node records a structured, non-fatal problem by writing the reserved
+        ``__error__`` channel. Until now nothing read it: no event carried it
+        and every renderer hides ``__`` channels, so the write landed in a
+        checkpoint file and nowhere else. When the channel changed this
+        superstep, emit one ``error_reported`` event per reporting node — the
+        lens counterpart of ``NODE_ERROR``, which is for *fatal* crashes.
+        """
+        if "__error__" not in state.values:
+            return
+        writers = [name for name, patch in writes if patch and "__error__" in patch]
+        # Only nodes that wrote the channel *this* superstep emit an event;
+        # the channel persists in checkpointed state, and a resume would
+        # otherwise re-report an old problem every step.
+        for node in writers:
+            self.emitter.emit(
+                ERROR_REPORTED,
+                node=node,
+                problem=state.values["__error__"],
+            )
 
     def _interrupt_payload(self, state: State) -> dict[str, Any] | None:
         """A node signals an interrupt by writing the ``__interrupt__`` channel."""

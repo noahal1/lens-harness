@@ -758,7 +758,14 @@ self.emitter.emit(
 - **不做写操作**：页面不能运行图、不能 resume、不能改 checkpoint、不能提交中断的审批。它只有一个方向——trace → 屏幕。所有 `POST` 都没有，`serve.py` 也只注册了 `do_GET`。
 - **不做通用 Web 应用**：没有账号、没有会话、没有多用户、没有 WebSocket（要实时就用浏览器原生的 `EventSource`）。
 - **不做前端工程化**：不引 React/Vue/Svelte，不引打包器，不引 TypeScript，不引测试框架。理由是原则二——如果画一个 trace 需要先装 300MB 依赖，那这个项目的可读性就没了。
-- **不做任意 trace 的合并视图**：一个 `serve` 进程只服务一个 trace 文件。要对比两次运行，开两个端口。
+### 不做任意 trace 的合并视图（M3 之后收窄）
+
+这条**曾被写成「不做多 trace」，M3 之后需要重新划界**——`lens diff` 与 `serve a.jsonl b.jsonl` 已经存在（第 13 节）。边界现在是：
+
+- **做了**：两份 trace 的**归一化行为对比**——先各自归一化（去掉每次运行必然不同的 5 个字段），再按结构键对齐。输出是 `same / changed / only-a / only-b` 四类，两端各有一个视图（终端 `diff` 子命令、浏览器 `/compare` 页）。
+- **仍然不做**：把两份 trace **合并成一个执行视图**（时间轴、图画布混画两个 run）。对比页是分节罗列差异，不是把两个 run 叠在一张图上——叠画需要回答「哪个 run 的当前状态是『当前』」，那是一套新的状态语义，M3 不碰。
+- **仍然不做**：两个以上的 trace。对比是两两关系；N 份 trace 的「聚类」是另一个工具。
+- **仍然不做**：多 trace 的实时 follow 对比。两份都在写的 trace 无法定义「对齐到哪一刻」。
 
 ### 不做流式的 state 输出
 
@@ -811,17 +818,19 @@ self.emitter.emit(
 
 **遗留语义（不是 bug，但要知道）**：`resume(config=RunConfig(thread_id="BETA"))` 里的 `thread_id` 现在**完全不生效** —— resume 的 thread 永远来自 parent checkpoint。想换 thread 只能重新 `invoke`。
 
-### 11.3 `resume()` 不发 `run_start`
+### 11.3 `resume()` 不发 `run_start`（已修复）
 
-实测事件序列从 `superstep_start` 开始：`superstep_start, node_start, node_end, state_merge, route_decision, checkpoint_created, checkpoint_created, run_end`。没有任何 `run_start`。后果：一段独立的 resumed trace 里**没有图快照**，`render_events` 会缺掉 `▶ run ...` 那一段，lens 无法从这份 trace 单独画出静态图。
+写作时的实测事件序列从 `superstep_start` 开始：`superstep_start, node_start, node_end, state_merge, route_decision, checkpoint_created, checkpoint_created, run_end`。没有任何 `run_start`。后果：一段独立的 resumed trace 里**没有图快照**，`render_events` 会缺掉 `▶ run ...` 那一段，lens 无法从这份 trace 单独画出静态图。
 
-### 11.4 `replay_state_at` 重建的是「摘要」，不是完整状态
+**修复**：`resume()` 现在在进入循环前发一条 `RUN_START`，带上与 `invoke` 相同的 `graph` 快照和 `inputs`（来自 checkpoint 状态的摘要），外加 `resumed_from=<checkpoint_id>` 标记。终端渲染器在 `▶ run ...` 行尾标注 `(resumed)`；浏览器 lens 记录 `vm.resumedFrom`。回归测试：`test_resume_emits_run_start_so_a_resumed_trace_is_self_describing`（`tests/test_kernel.py`）。
 
-`render.py:308-332` 的实现取的是 `state_merge` 事件里的 `state` 字段，而那个字段经 `summarize_state` 截断过（`events.py:268-284`）。
+### 11.4 `replay_state_at` 重建的是「摘要」，不是完整状态（已修复：改名 + CLI 优先读 checkpoint）
+
+写作时 `render.py:308-332` 的实现取的是 `state_merge` 事件里的 `state` 字段，而那个字段经 `summarize_state` 截断过（`events.py:268-284`）。
 
 实测：状态里 `big` 是 500 字符、`items` 是 40 项，`replay_state_at` 给出 `big` 长度 **132**（= 120 + `"…(500 chars)"`）、`items` 长度 **9**（= 8 项 + `"…(+32 more)"`），而 `checkpoint.state` 里是完整的 500 / 40。
 
-docstring 说的「State as of a checkpoint, reconstructed from the trace alone」以及「no graph, no runtime, no re-execution」在**结构**上成立，但值域上是摘要。测试 `test_replay_state_at_rebuilds_state_from_trace_alone`（`tests/test_kernel.py:337`）用的是短值（`n=5`、`path=["a"]`），所以没暴露这个边界。名字改成 `replay_state_summary_at` 会更诚实。
+**修复**：函数改名为 `replay_state_summary_at`——docstring 不再声称超出摘要的保真度。CLI 的 `state` 子命令现在**优先读取 trace 旁边 `checkpoints/<id>.json` 里的完整状态**，读不到才回退到 trace 摘要，并且输出第一行注明数据来源（`# full state from checkpoint file` / `# full state from trace summary (long values truncated)`）。回归测试：`test_replay_state_summary_is_truncated_but_checkpoint_is_full`。
 
 ### 11.5 同一个 checkpoint id 会发两条 `checkpoint_created`
 
@@ -833,9 +842,11 @@ docstring 说的「State as of a checkpoint, reconstructed from the trace alone�
 
 `break` 发生在 `superstep += 1` 之前（`runtime.py:257-262`），所以中断时 `run_end.supersteps` 是**出事那一步的索引**。实测单步内中断：`status=interrupted`、`supersteps=0`、checkpoint `superstep=0`、`superstep_start.index=[0]`——明明跑了一个 superstep，计数器却是 0。正常结束的 5 步 run 则报 `supersteps=5`。同一个字段两种语义，消费方需要配合 `status` 才能解释。
 
-### 11.7 `STATUS_RESUMED` 定义了但从未使用
+### 11.7 `STATUS_RESUMED` 定义了但从未使用（已修复：删除）
 
-`checkpoint.py:29` 定义、`__init__.py:19` 与 `:60` 导出，全仓 `grep` 找不到任何写入点。resume 之后的 checkpoint 状态是 `running`/`complete`，不是 `resumed`。要么删掉，要么补上写入。
+写作时 `checkpoint.py:29` 定义、`__init__.py:19` 与 `:60` 导出，全仓 `grep` 找不到任何写入点。resume 之后的 checkpoint 状态是 `running`/`complete`，不是 `resumed`。
+
+**修复**：选择**删除**而不是补写入。补写入需要给 resume 的锚点 checkpoint 改状态，那会覆盖 `interrupted`——而 §6.3 明确说 `interrupted` 是一等状态、是 human-in-the-loop resume 的锚点，改写它就破坏了这个契约。删除后 `STATUS_RESUMED` 不再出现在 `checkpoint.py` 与 `__all__`。回归测试：`test_status_resumed_is_gone`。
 
 ### 11.8 `run_start` 的图快照里 `descriptions` 装的是 mapping（已修复）
 
@@ -850,9 +861,11 @@ docstring 说的「State as of a checkpoint, reconstructed from the trace alone�
 
 注意 `snapshot()` 现在把两者的语义分开了，但 `candidates` 字段仍然只是 `list(ce.mapping)`（`graph.py:71-73`），即「返回值全集」，不含说明。
 
-### 11.9 `__error__` 保留 channel 没有任何消费者
+### 11.9 `__error__` 保留 channel 没有任何消费者（已修复）
 
-`state.py:45` 声明 `RESERVED_CHANNELS = ("__interrupt__", "__error__")`，注释说它用来「record a structured, non-fatal problem for the lens」。`apply_patch` 会接受节点写入（`state.py:230-234`），`graph.py:222` 也放行它进入初始状态。但 `runtime.py` **从不读它**：没有对应事件、没有 checkpoint 字段。
+写作时 `state.py:45` 声明 `RESERVED_CHANNELS = ("__interrupt__", "__error__")`，注释说它用来「record a structured, non-fatal problem for the lens」。`apply_patch` 会接受节点写入（`state.py:230-234`），`graph.py:222` 也放行它进入初始状态。但 `runtime.py` **从不读它**：没有对应事件、没有 checkpoint 字段。
+
+**修复**：新增第 12 种事件 `error_reported`（`events.py` 的 `EVENT_SCHEMA`：必填键 `node`、`problem`）。superstep 合并后，runtime 检查哪些节点在本步写入了 `__error__`，每个写入者发一条 `error_reported`。两个关键语义：(1) 只有**本步写入**的节点发事件——channel 会随 checkpoint 持久化，resume 时不得重报旧问题；(2) 它是非致命报告，run 照常继续，与 `node_error`（节点抛异常、run 转 `failed`）互补。终端渲染器画 `⚠ reported <node>: ...`；浏览器 lens 推进 `vm.errors` 但不改 `vm.status`。回归测试：`test_error_reported_event_gives_the_reserved_channel_a_consumer`（含 resume 不重报的断言）。
 
 更进一层：`state_merge` 的 `diff` 现在显式过滤掉所有 `__` 开头的 channel（`runtime.py:421-428`，注释解释了为什么——否则会渲染出一行 `__interrupt__: null → null` 的无意义 diff），`summarize_state` 也一直隐藏它们（`events.py:276-277`）。所以写 `__error__` 的唯一效果是它躺在 checkpoint 的 `state` 里，任何事件、任何渲染器都看不到。`__interrupt__` 至少还有 `interrupt` 事件把它抬出来；`__error__` 连这个都没有。
 
@@ -864,9 +877,11 @@ docstring 说的「State as of a checkpoint, reconstructed from the trace alone�
 
 这条曾经值得记下来的理由不是拼写：**「有 index」这个假象会让人以为 `all()` 是读索引、以为删除文件后索引会残留**。现在注释和实现都是「扫目录、无索引」，那 `all()` 每次调用 O(n) 扫盘（`checkpoint.py:144-157`，还跳过解析失败的文件）就是**明示的设计**，不是意外。
 
-### 11.11 一个 `Runtime` 实例只能跑一次 run
+### 11.11 一个 `Runtime` 实例只能跑一次 run（已修复）
 
-`Emitter` 在 `Runtime.__init__` 里创建一次（`runtime.py:99`），`invoke` 直接复用 `self.emitter.run_id`（`runtime.py:110`），`seq` 永不清零。实测（一个最小探针图，两次 `invoke()`）：两次拿到**相同**的 `run_id`，`seq` 接着上一轮 continue（共 18 条事件，两轮混在一条序列里），只有 checkpoint id 因 uuid 后缀不同而不同。要跑多次 run，就 new 一个 `Runtime`。
+写作时 `Emitter` 在 `Runtime.__init__` 里创建一次（`runtime.py:99`），`invoke` 直接复用 `self.emitter.run_id`（`runtime.py:110`），`seq` 永不清零。实测（一个最小探针图，两次 `invoke()`）：两次拿到**相同**的 `run_id`，`seq` 接着上一轮 continue（共 18 条事件，两轮混在一条序列里），只有 checkpoint id 因 uuid 后缀不同而不同。要跑多次 run，就 new 一个 `Runtime` 实例。
+
+**修复**：`invoke()` 现在每次生成新的 `run_id`、调用 `Emitter.reset_seq()`（锁内归零）、重置 `superstep=-1`。同一个 Runtime 可以连续 `invoke` 多次，每次是独立的一条 trace 序列。`resume` 不受影响——它沿用 checkpoint 的 `run_id`，这是刻意的（同一 run 的续篇）。回归测试：`test_one_runtime_can_invoke_twice_with_independent_runs`。
 
 后果：想跑两次对比，必须每次新建 `Runtime`（`examples/agent.py:184` 就是这么做的，一次 run 一个实例）。docstring/文档里没有写这条约束。
 
@@ -1077,13 +1092,73 @@ data: {"seq":7,"kind":"node_end",...}
 非 ASCII 数字因此被接受，与 docstring 承诺的「只要 ASCII 数字」相反。现在是 `body.isascii() and body.isdigit()`。
 ---
 
+## 13. trace 对比（M3）
+
+### 13.1 一句话
+
+`lens diff a.jsonl b.jsonl` 回答：**归一化掉每次运行必然不同的东西之后，这两次运行的行为差在哪？** 浏览器版是 `lens serve a.jsonl b.jsonl` 的 `/compare` 页。
+
+### 13.2 为什么裸 diff 没有用
+
+README 早就实测过：两份 trace 的 `ts`、`run_id`、`checkpoint_id`、`parent_id`、`duration_ms` 这 5 个字段**必然**不同，所以 `diff` 永远非空。M1/M2 的视图回答「一次运行里发生了什么」，M3 回答的是另一个方向的问题——「两次运行差在哪」，这要求先定义「什么不算差」。
+
+### 13.3 归一化（`compare.py`）
+
+归一化是契约的核心，规则只有三条：
+
+1. **丢弃**：`ts`（时序）、`run_id`（身份）、`duration_ms`（机器噪音）。丢掉它们是「diff 为空 ⟺ 行为相同」成立的前提。
+2. **占位**：`checkpoint_id` / `parent_id` → `ss<N>`（N = checkpoint 的 superstep）。真实 id 含 6 位随机 hex，但「第 2 步产出的 checkpoint」是故事结构里的稳定位置。
+3. **聚合**：`node_token` 逐块事件 → 每 `(superstep, node)` 一条整段文本。逐 chunk 对齐 diff 出的是切块粒度（`chunk_size` 一变就全红），不是模型说了什么。
+
+### 13.4 对齐
+
+每条记录拿一个结构键，按首见顺序配对：
+
+| 事件 | 键 |
+| --- | --- |
+| `run_start` | `(kind, 序号)` —— 含 resume 的 trace 有两条，按出现顺序配 |
+| `superstep_start` | `(kind, index)` |
+| `node_start` / `node_end` / `node_error` | `(kind, superstep, node)` |
+| `route_decision` | `(kind, superstep, source)` |
+| `state_merge` | `(kind, superstep)` |
+| `checkpoint_created` | `(kind, 占位 id, status)` |
+| tokens 聚合 | `("tokens", superstep, node)` |
+| 其余（`interrupt`、`error_reported`…） | `(kind, superstep, node)` |
+
+对齐结果是四类：`same`、`changed`（列出具体字段）、`only-a`、`only-b`。
+
+**已知的结构性余波（不是 bug）**：两个 run 结束位置不同时，`run_end`（键含 supersteps 数）和终态 checkpoint（superstep 号不同）会各自出现在 only 侧。节点级事件不受影响——`test_only_on_one_side_is_reported` 专门钉住「a 是 b 的严格子集时，only-a 里不得出现任何节点级事件」，防止将来有人把余波当 bug 修掉。
+
+### 13.5 两个视图，一个内核
+
+与 M1/M2 同构：`compare.py` 是纯函数内核（只 import `events`，原则二），两个消费者并列：
+
+- **终端**：`cmd_diff` → `render_diff`，有差异退出码 1（GNU diff 约定，方便脚本）。
+- **浏览器**：`/api/diff` 把对比结果序列化成一个 JSON 文档，`web/compare.html` 取它、渲染它。页面不 import 内核、不做任何计算——对比在服务端做完了，页面只画判决。每次请求现算不用缓存：trace 文件可能被重跑改写，缓存的 diff 会对现在文件里的内容说谎。
+
+单 trace 启动时 `/compare` 是 404、`/api/diff` 是 504，都带人话消息——静默失败在这里同样不可接受。
+
+### 13.6 验收测试（`tests/test_compare.py`，8 条）
+
+- `test_identical_runs_diff_clean` —— **同一个图跑两次，diff 必须为空**。这是整条推理链的地基；若它红了，归一化就漏了噪音字段。
+- `test_checkpoint_ids_become_stable_placeholders` —— uuid 后缀不得漏进键或数据。
+- `test_token_events_aggregate_into_one_record` —— 切块方式不进 diff。
+- `test_changed_state_is_found_and_named` —— changed 记录必须列出字段，且字段里不得有噪音。
+- `test_only_on_one_side_is_reported` —— 见 13.4 的余波说明。
+- `test_node_error_differences_are_visible` —— 失败 vs 成功的 run，`node_error` 必须出现在 diff 里。
+- `test_render_diff_is_readable_and_respects_max_only` —— identical 一行、差异分节、`--max-only` 截断。
+- `test_resume_trace_diffs_clean_against_itself` —— 含 invoke+resume 的 trace 对自己 diff 必须干净（钉住多 `run_start` 配对逻辑）。
+
+---
+
 ## 附：如何跑起来
 
 ```bash
-# 内核自测（25 个）+ 流程自测（8 个）+ lens serve 自测（31 个）
+# 内核自测（30 个）+ 流程自测（8 个）+ lens serve 自测（31 个）+ trace 对比自测（8 个）
 py -3.13 -m tests.test_kernel
 py -3.13 -m tests.test_flows
 py -3.13 -m tests.test_serve
+py -3.13 -m tests.test_compare
 
 # 渲染一份现有 trace
 py -3.13 -m lens_harness show traces/r_70b323a6.jsonl

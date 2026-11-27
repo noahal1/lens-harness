@@ -347,9 +347,14 @@ def test_every_event_validates_and_seq_is_dense():
 
 
 @test
-def test_replay_state_at_rebuilds_state_from_trace_alone():
-    """The lens must be able to answer "state at checkpoint" from events only."""
-    from lens_harness.render import replay_state_at
+def test_replay_state_summary_at_rebuilds_state_from_trace_alone():
+    """The lens must be able to answer "state at checkpoint" from events only.
+
+    The function is the *summary* rebuild (renamed from ``replay_state_at``,
+    DESIGN.md §11.4): values longer than summarize_state's limits arrive
+    truncated, and the full values live only in the checkpoint file.
+    """
+    from lens_harness.render import replay_state_summary_at
 
     fixture = Fixture()
     try:
@@ -359,10 +364,36 @@ def test_replay_state_at_rebuilds_state_from_trace_alone():
         g.add_edge("a", END)
         result = fixture.run(g, {"n": 0, "path": []})
 
-        rebuilt = replay_state_at(fixture.sink.events, result.checkpoints[-1].checkpoint_id)
+        rebuilt = replay_state_summary_at(fixture.sink.events, result.checkpoints[-1].checkpoint_id)
         assert rebuilt is not None, "replay returned None"
         assert_eq(rebuilt["n"], 5, "replayed n")
         assert_eq(rebuilt["path"], ["a"], "replayed path")
+    finally:
+        fixture.cleanup()
+
+
+@test
+def test_replay_state_summary_is_truncated_but_checkpoint_is_full():
+    """The trace alone can only give a summary; the checkpoint file has it all."""
+    from lens_harness.render import replay_state_summary_at
+
+    class BigState(TypedDict):
+        big: str
+
+    fixture = Fixture()
+    try:
+        g = StateGraph(BigState, name="big")
+        g.add_node("a", lambda s, c: {"big": "x" * 500})
+        g.set_entry("a")
+        g.add_edge("a", END)
+        result = fixture.run(g, {"big": ""})
+
+        rebuilt = replay_state_summary_at(fixture.sink.events, result.checkpoints[-1].checkpoint_id)
+        assert rebuilt is not None
+        assert_true(len(rebuilt["big"]) < 200, "trace summary is truncated")
+        loaded = fixture.store.load(result.checkpoints[-1].checkpoint_id)
+        assert loaded is not None
+        assert_eq(len(loaded.state["big"]), 500, "checkpoint file holds the full value")
     finally:
         fixture.cleanup()
 
@@ -885,6 +916,121 @@ def test_last_seq_in_file_finds_the_tail_record():
         assert_eq(last_seq_in_file(path), 5, "the completed record counts")
     finally:
         fixture.cleanup()
+
+
+@test
+def test_resume_emits_run_start_so_a_resumed_trace_is_self_describing():
+    """A trace that starts at a resume must still carry the graph snapshot.
+
+    Regression (DESIGN.md §11.3): ``resume()`` used to begin at
+    ``superstep_start``, so a standalone resumed trace had no ``run_start`` —
+    no graph snapshot, no entry node — and the lens could not draw it.
+    """
+    from lens_harness.events import RUN_START
+
+    fixture = Fixture()
+    try:
+        g = StateGraph(LoopState, name="resume-meta")
+        g.add_node("a", lambda s, c: {"n": s["n"] + 1, "path": ["a"]})
+        g.set_entry("a")
+        g.add_edge("a", END)
+        runtime = Runtime(g.compile(), fixture.store, fixture.sink)
+        result = runtime.invoke({"n": 0, "path": []}, RunConfig(thread_id="t"))
+
+        before = len(fixture.kinds(RUN_START))
+        runtime.resume(result.checkpoints[-1].checkpoint_id)
+        starts = fixture.kinds(RUN_START)
+        assert_eq(len(starts), before + 1, "resume emits exactly one run_start")
+        latest = starts[-1]
+        assert_true("graph" in latest.data and "entry" in latest.data.get("graph", {}),
+                    "run_start carries the graph snapshot")
+        assert_eq(latest.data.get("resumed_from"), result.checkpoints[-1].checkpoint_id,
+                  "run_start marks what it resumed from")
+    finally:
+        fixture.cleanup()
+
+
+@test
+def test_one_runtime_can_invoke_twice_with_independent_runs():
+    """A second invoke must not continue the first run's seq or run_id.
+
+    Regression (DESIGN.md §11.11): the emitter was created once and never
+    reset, so two invokes on one Runtime shared a run_id and interleaved
+    their seqs in one trace.
+    """
+    from lens_harness.events import RUN_START
+
+    fixture = Fixture()
+    try:
+        g = StateGraph(LoopState, name="twice")
+        g.add_node("a", lambda s, c: {"n": s["n"] + 1, "path": ["a"]})
+        g.set_entry("a")
+        g.add_edge("a", END)
+        runtime = Runtime(g.compile(), fixture.store, fixture.sink)
+        r1 = runtime.invoke({"n": 0, "path": []}, RunConfig(thread_id="t"))
+        r2 = runtime.invoke({"n": 10, "path": []}, RunConfig(thread_id="t"))
+
+        assert_true(r1.run_id != r2.run_id, "each invoke gets its own run_id")
+        starts = [e for e in fixture.sink.events if e.kind == RUN_START]
+        ids = [e.run_id for e in starts]
+        assert_eq(ids, [r1.run_id, r2.run_id], "two run_starts, each under its run")
+        seqs = sorted(e.seq for e in fixture.sink.events if e.run_id == r2.run_id)
+        assert_eq(seqs, list(range(len(seqs))), "second run's seq restarts at 0, dense")
+    finally:
+        fixture.cleanup()
+
+
+@test
+def test_error_reported_event_gives_the_reserved_channel_a_consumer():
+    """Writing ``__error__`` must reach the trace, not just the checkpoint.
+
+    Regression (DESIGN.md §11.9): the channel was accepted on write but read
+    by nothing — no event, and every renderer hides ``__`` channels.
+    """
+    from lens_harness.events import ERROR_REPORTED
+
+    class ErrState(TypedDict):
+        n: int
+
+    fixture = Fixture()
+    try:
+        g = StateGraph(ErrState, name="reported")
+        g.add_node("warn", lambda s, c: {"n": 1, "__error__": {"code": "stale"}})
+        g.set_entry("warn")
+        g.add_edge("warn", END)
+        result = fixture.run(g, {"n": 0})
+
+        reports = fixture.kinds(ERROR_REPORTED)
+        assert_eq(len(reports), 1, "one event per reporting node")
+        assert_eq(reports[0].data["node"], "warn", "reporting node")
+        assert_eq(reports[0].data["problem"], {"code": "stale"}, "the payload")
+        # The run itself still completed: reported != fatal.
+        assert_eq(result.status, "complete", "a reported problem is non-fatal")
+
+        # A resume from the finished checkpoint must NOT re-report the old
+        # problem: only a *fresh* write emits an event.
+        runtime = Runtime(g.compile(), fixture.store, fixture.sink)
+        runtime.resume(result.checkpoints[-1].checkpoint_id)
+        assert_eq(len(fixture.kinds(ERROR_REPORTED)), 1, "no re-report on resume")
+    finally:
+        fixture.cleanup()
+
+
+@test
+def test_status_resumed_is_gone():
+    """The never-written constant was removed, not wired in (DESIGN.md §11.7).
+
+    Marking the resume anchor would clobber ``interrupted``, which the
+    human-in-the-loop contract treats as a first-class state.
+    """
+    import lens_harness
+
+    assert_true(not hasattr(lens_harness, "STATUS_RESUMED"),
+                "STATUS_RESUMED no longer on the public surface")
+    from lens_harness import checkpoint as ckpt_mod
+
+    assert_true(not hasattr(ckpt_mod, "STATUS_RESUMED"),
+                "STATUS_RESUMED gone from checkpoint.py")
 
 
 # --------------------------------------------------------------------------

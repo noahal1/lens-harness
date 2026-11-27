@@ -21,7 +21,6 @@ from .checkpoint import (
     STATUS_COMPLETE,
     STATUS_FAILED,
     STATUS_INTERRUPTED,
-    STATUS_RESUMED,
     STATUS_RUNNING,
     Checkpoint,
     CheckpointStore,
@@ -62,7 +61,7 @@ __all__ = [
     "Runtime", "RunConfig", "RunResult", "GraphRecursionError",
     # checkpoints
     "Checkpoint", "CheckpointStore", "STATUS_RUNNING", "STATUS_COMPLETE",
-    "STATUS_INTERRUPTED", "STATUS_FAILED", "STATUS_RESUMED",
+    "STATUS_INTERRUPTED", "STATUS_FAILED",
     # events
     "Event", "EventSink", "JsonlSink", "ListSink", "NullSink", "TeeSink",
     "EventSchemaError", "read_trace", "follow_trace", "summarize_state",

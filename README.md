@@ -165,7 +165,9 @@ checkpoint DAG
 | `checkpoints <trace>` | 列出 checkpoint 及状态（已按 id 去重） |
 | `state <trace> [ckpt_id]` / `state <trace> --at N` | 某个 checkpoint 的状态 |
 | `watch <trace>` | 跟随一段正在写入的 trace |
+| `diff <trace-a> <trace-b>` | 归一化后对比两份 trace（有差异退出码 1） |
 | `serve <trace> [--host H] [--port P] [--follow]` | 在浏览器里看同一份 trace |
+| `serve <trace-a> <trace-b>` | 浏览器版对比页（`/compare`） |
 | `run <mod:attr> [--input JSON] [--trace-dir DIR] [--llm SPEC]` | 跑示例，写 trace 并渲染 |
 
 下面的命令块里 `<trace>` 都换成你自己的那份 jsonl 路径（本文样例用 `traces/r_c22281d6.jsonl`）。
@@ -262,25 +264,28 @@ options:
 ```
 lens-harness/
 ├── lens_harness/          # 内核 + 渲染器
-│   ├── events.py          # 事件契约：Event、EVENT_SCHEMA、11 种事件、sink、read/follow
+│   ├── events.py          # 事件契约：Event、EVENT_SCHEMA、12 种事件、sink、read/follow
 │   ├── state.py           # channel、reducer（overwrite/add/add_unique/merge_dict）、patch
 │   ├── graph.py           # StateGraph 声明与编译、NodeContext、START/END
 │   ├── runtime.py         # ★ superstep 循环（整套东西的心脏）
 │   ├── checkpoint.py      # Checkpoint / CheckpointStore，时间旅行靠它
 │   ├── render.py          # ★ 纯函数渲染器：只吃 list[Event]
-│   ├── serve.py           # 把同一份 trace 用 SSE 推给浏览器（第 12 节）
+│   ├── compare.py         # ★ M3 trace 对比：归一化 + 对齐 + diff（只 import events）
+│   ├── serve.py           # 把同一份 trace 用 SSE 推给浏览器（第 12 节）；双 trace 时加 /compare + /api/diff
 │   ├── web/
-│   │   └── index.html     # ★ 浏览器渲染器：单文件、零依赖、零构建
+│   │   ├── index.html     # ★ 浏览器渲染器：单文件、零依赖、零构建
+│   │   └── compare.html   # ★ M3 对比页：吃 /api/diff 的 JSON，同样零依赖
 │   ├── llm.py             # MockLLM / OpenAICompatibleLLM / RecordingLLM
-│   ├── cli.py             # 上面那八个子命令
+│   ├── cli.py             # 上面那九个子命令
 │   └── __init__.py        # 公开面（__version__ = "0.1.0"）
 ├── examples/
 │   ├── agent.py           # tool-calling loop：agent ⇄ tools
 │   └── approval.py        # human-in-the-loop：interrupt → 人类回复 → resume
 ├── tests/
-│   ├── test_kernel.py     # 25 项，内核契约
+│   ├── test_kernel.py     # 30 项，内核契约
 │   ├── test_flows.py      # 8 项，interrupt/resume + LLM
-│   └── test_serve.py      # 31 项，SSE 传输 + 页面纯度
+│   ├── test_serve.py      # 31 项，SSE 传输 + 页面纯度
+│   └── test_compare.py    # 8 项，M3 trace 对比契约
 ├── traces/                # 运行时产物
 │   ├── r_XXXXXXXX.jsonl   # 一份 trace（run_id = "r_" + uuid4 hex[:8]）
 │   └── checkpoints/       # <thread_id>_<superstep:04d>_<hex6>.json
@@ -746,7 +751,63 @@ $ py -3.13 -m lens_harness run examples.agent:build --llm mock --input '{"questi
 
 ---
 
-## 常见问题
+## trace 对比（M3）
+
+README 早前说过「没有内建的 diff 命令」，M3 补上了。核心问题：两份 trace 的 `ts` / `run_id` / `checkpoint_id` / `parent_id` / `duration_ms` 这 5 个字段**每次运行必然不同**，裸 `diff` 永远非空、永远没有信息量。`lens diff` 做的是：把这层噪音归一化掉之后，剩下的差异就是**行为差异**。
+
+### 终端
+
+```bash
+py -3.13 -m lens_harness diff traces/run-a.jsonl traces/run-b.jsonl
+```
+
+同一个示例跑两次，输出是一行：
+
+```
+■ identical: 36 aligned records, every behavioral field matches
+```
+
+（退出码 0。）换一个问题再跑，输出分三段：
+
+```
+trace diff  36 aligned records
+  same: 24   changed: 12   only-a: 0   only-b: 0
+
+── changed ──
+  run_start 0  inputs
+    a: {"answer": "", "messages": [{"content": "What is 17*23?"...
+    b: {"answer": "", "messages": [{"content": "hi there"...
+
+── only-b (only in trace b) ──
+  node_start 2 extra ...
+```
+
+退出码学 GNU diff：**有差异 = 1**（是信号，不是报错），脚本里写 `lens diff a b || true`。
+
+### 归一化规则（`lens_harness/compare.py`）
+
+| 字段 | 处理 | 理由 |
+| --- | --- | --- |
+| `ts` / `run_id` / `duration_ms` | 丢弃 | 身份与时序不是行为 |
+| `checkpoint_id` / `parent_id` | 替换成 `ss<N>` 占位符 | uuid 后缀每次都变，但「第 N 步的 checkpoint」是故事里稳定的位置 |
+| `node_token` 事件 | 聚合成每 `(superstep, node)` 一条整段文本 | 逐 chunk 对齐只会 diff 出「切块方式」，不是内容 |
+
+其余逐字段保留并对齐：节点事件按 `(kind, superstep, node)` 配对，`superstep_start` 按 index，含 resume 的 trace（会有两条 `run_start`）按出现顺序配对。对齐后四类：`same` / `changed`（同位置不同值，列出具体字段）/ `only-a` / `only-b`。
+
+**判读规则**：`only-a`/`only-b` 里的节点级事件是真差异（一条路由没走、一步没跑）；但 run 结束位置不同时，`run_end` 和终态 checkpoint 会因 superstep 号对不上而各自出现在 only 侧——这是结构性余波，不是多跑了一个节点。
+
+### 浏览器
+
+```bash
+py -3.13 -m lens_harness serve traces/run-a.jsonl traces/run-b.jsonl
+```
+
+服务端多开两个路由：`/compare`（对比页，单文件、零依赖，与主页面同一套纯度标准——不 import 内核）和 `/api/diff`（对比结果 JSON，每次请求现算，不用缓存）。页面按 `changed` / `only-a` / `only-b` 分节渲染。单 trace 启动时 `/compare` 返回 404、`/api/diff` 返回 504，都不是静默。
+
+### 测试
+
+`tests/test_compare.py`（8 条，`py -3.13 -m tests.test_compare`）。最要紧的一条是 `test_identical_runs_diff_clean`：**同一个图跑两次，diff 必须为空**——这是归一化的验收标准，也是「diff 非空 ⟹ 行为有差」这条推理链的地基。另有一条故意钉住 only 侧的结构性余波（见上面判读规则），防止将来有人把它当 bug「修」掉。
+
 
 ### 怎么找到我刚刚跑的那份 trace？
 
@@ -816,7 +877,7 @@ diff 之前先知道**哪些差异是噪音**：`ts`、`run_id`、`data.checkpoi
 
 1. **每次运行的 `run_id` 和 checkpoint id 都不同。** 本文样例里的 `r_c22281d6` / `demo_0000_51d41f` 这些照抄是跑不出来的，按上面「怎么找到我刚刚跑的那份 trace」自己取。
 
-2. **`state` 给的是摘要不是完整状态。** 见上面「`state`」那节的 ⚠️：长字符串会被截到 120 字符、长列表只留前 8 项。要完整值得读 `traces/checkpoints/<id>.json`。
+2. **`state` 给的是摘要不是完整状态。** M3 之后 CLI 会先读 `checkpoints/<id>.json` 给完整状态（输出首行注明来源），只有 checkpoint 文件缺失时才回退到 trace 摘要。直接调 `replay_state_summary_at` 得到的仍是摘要。
 
 3. **`show` 不打印路由候选的人读说明。** `route_decision` 事件里其实带了 `descriptions`（比如 `'approval': 'the action is destructive and needs a human'`），但终端渲染器只画了 `candidates` 名字。想看说明得读 JSONL，或者去浏览器 lens 里把鼠标停在虚线上（前提是这份 trace 的图快照带 `mapping`+`descriptions`，新跑出来的都带；早期写下的 trace 里 `descriptions` 存的是节点名，页面会自动兼容，只是没有说明可显示）。
 

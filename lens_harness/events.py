@@ -33,6 +33,7 @@ ROUTE_DECISION = "route_decision"
 CHECKPOINT_CREATED = "checkpoint_created"
 INTERRUPT = "interrupt"
 NODE_ERROR = "node_error"
+ERROR_REPORTED = "error_reported"
 
 #: ``kind -> required data keys``. Used by :func:`validate_event` so a typo in
 #: the kernel fails loudly instead of producing a trace the lens cannot read.
@@ -50,6 +51,7 @@ EVENT_SCHEMA: dict[str, frozenset[str]] = {
     CHECKPOINT_CREATED: frozenset({"checkpoint_id", "parent_id", "next_nodes", "status"}),
     INTERRUPT: frozenset({"checkpoint_id", "node", "payload", "resume_schema"}),
     NODE_ERROR: frozenset({"node", "error_type", "error", "traceback"}),
+    ERROR_REPORTED: frozenset({"node", "problem"}),
 }
 
 
@@ -229,6 +231,16 @@ class Emitter:
             self._seq += 1
             self.sink.emit(event)
         return event
+
+    def reset_seq(self) -> None:
+        """Restart ``seq`` from 0 — used when a Runtime starts a new run.
+
+        Must only be called between runs (never mid-run): a dense ``seq`` is
+        what every consumer sorts by, and the lock above is what keeps it
+        dense under parallel nodes.
+        """
+        with self._lock:
+            self._seq = 0
 
 
 # --------------------------------------------------------------------------

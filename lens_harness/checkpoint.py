@@ -23,11 +23,13 @@ from .events import _json_default
 
 #: Checkpoint lifecycle. ``interrupted`` is a first-class state, not an error —
 #: it is the anchor a human-in-the-loop resume starts from.
-STATUS_RUNNING = "running"
-STATUS_COMPLETE = "complete"
+STATUS_RUNNING     = "running"
+STATUS_COMPLETE    = "complete"
 STATUS_INTERRUPTED = "interrupted"
-STATUS_FAILED = "failed"
-STATUS_RESUMED = "resumed"
+STATUS_FAILED      = "failed"
+# ``STATUS_RESUMED`` was removed (DESIGN.md §11.7): it was defined but never
+# written, and marking the resume *anchor* checkpoint would clobber the
+# ``interrupted`` state that the human-in-the-loop contract depends on.
 
 
 @dataclass(slots=True)

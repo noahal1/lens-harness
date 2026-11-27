@@ -17,6 +17,7 @@ from typing import Any, Iterable, Sequence
 
 from .events import (
     CHECKPOINT_CREATED,
+    ERROR_REPORTED,
     EVENT_SCHEMA,
     INTERRUPT,
     NODE_END,
@@ -140,7 +141,9 @@ def render_events(
 
         if kind == RUN_START:
             graph = data.get("graph", {})
-            add(pal.bold(f"▶ run {event.run_id}") + pal.dim(f"  thread={event.thread_id}"))
+            resumed = data.get("resumed_from")
+            label = pal.dim(" (resumed)") if resumed else ""
+            add(pal.bold(f"▶ run {event.run_id}") + pal.dim(f"  thread={event.thread_id}") + label)
             add(f"{opts.indent}graph: {pal.cyan(graph.get('name', '?'))}  "
                 f"entry: {pal.cyan(graph.get('entry', '?'))}")
             node_names = [n["name"] for n in graph.get("nodes", [])]
@@ -187,6 +190,10 @@ def render_events(
 
         elif kind == NODE_ERROR:
             add(f"{opts.indent}{opts.indent}{pal.red('✖ ' + data['error_type'])}: {data['error']}")
+
+        elif kind == ERROR_REPORTED:
+            add(f"{opts.indent}{opts.indent}{pal.yellow('⚠ reported')} "
+                f"{pal.dim(data['node'])}: {_short(data.get('problem'), 80)}")
 
         elif kind == STATE_MERGE and opts.show_state:
             changed = data.get("changed_channels") or []
@@ -305,8 +312,8 @@ def render_summary(events: Sequence[Event], palette: Palette | None = None) -> s
     return "\n".join(lines)
 
 
-def replay_state_at(events: Sequence[Event], checkpoint_id: str) -> dict[str, Any] | None:
-    """State as of a checkpoint, reconstructed from the trace alone.
+def replay_state_summary_at(events: Sequence[Event], checkpoint_id: str) -> dict[str, Any] | None:
+    """Summarized state as of a checkpoint, reconstructed from the trace alone.
 
     Note what this *cannot* need: no graph, no runtime, no re-execution. That
     is the payoff of "trace is the source of truth".
@@ -314,6 +321,15 @@ def replay_state_at(events: Sequence[Event], checkpoint_id: str) -> dict[str, An
     A checkpoint is committed *after* the superstep's ``state_merge``, so the
     last merge at or before the checkpoint's ``seq`` is exactly the state it
     captured.
+
+    The result is a **summary**, not the full state: ``state_merge`` events
+    carry ``summarize_state`` output (long strings truncated at 120 chars,
+    lists cut at 8 items), because traces must stay readable and small. The
+    full values live in ``traces/checkpoints/<id>.json``; the ``state`` CLI
+    command reads that file first and falls back to this summary only when
+    the checkpoint file is missing (renamed from ``replay_state_at`` — the
+    old name claimed more fidelity than the trace alone can deliver,
+    DESIGN.md §11.4).
     """
     target_seq: int | None = None
     for event in events:

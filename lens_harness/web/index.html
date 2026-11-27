@@ -523,6 +523,7 @@
         vm.config = d.config || {};
         vm.state = d.inputs || {};
         vm.status = "running";
+        vm.resumedFrom = d.resumed_from || null;
         if (vm.graph) vm.lay = layout(vm.graph);
         break;
 
@@ -621,6 +622,10 @@
         vm.errors.push({ node: d.node, error: d.error, seq: ev.seq });
         vm.errored[d.node] = true;
         vm.status = "error";
+        break;
+
+      case "error_reported":
+        vm.errors.push({ node: d.node, error: "reported: " + JSON.stringify(d.problem), seq: ev.seq });
         break;
 
       case "run_end":

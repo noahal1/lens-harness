@@ -9,14 +9,18 @@ Commands::
     python -m lens_harness state traces/<file>.jsonl [<ckpt_id>]
     python -m lens_harness state traces/<file>.jsonl --at <superstep>
     python -m lens_harness watch traces/<file>.jsonl       # follow a live run
+    python -m lens_harness diff traces/a.jsonl traces/b.jsonl  # compare two traces
     python -m lens_harness serve traces/<file>.jsonl       # the web view of a trace
+    python -m lens_harness serve a.jsonl b.jsonl           # the diff in a browser
     python -m lens_harness run examples.agent:build --input '{"question":"..."}'
 
 ``show``/``dag``/``checkpoints``/``watch``/``serve`` take only a trace. ``state``
 takes the trace first and then optionally a checkpoint id, or ``--at N`` for the
-state that superstep produced. ``--no-color`` works before or after the
-subcommand. ``serve`` opens a browser page that is a pure function of the same
-trace the terminal renderer reads; ``--follow`` keeps reading a run in progress.
+state that superstep produced. ``diff`` takes exactly two traces and exits 1
+when they differ (GNU diff convention). ``serve`` opens a browser page that is
+a pure function of the same trace the terminal renderer reads; ``--follow``
+keeps reading a run in progress; a second trace argument switches it to the
+comparison page (/compare + /api/diff).
 """
 
 from __future__ import annotations
@@ -37,7 +41,7 @@ from .render import (
     render_checkpoint_dag,
     render_events,
     render_summary,
-    replay_state_at,
+    replay_state_summary_at,
 )
 
 
@@ -119,11 +123,36 @@ def cmd_state(args: argparse.Namespace) -> int:
         target = matches[-1]["checkpoint_id"]
     if target is None:
         raise SystemExit("pass a checkpoint id, or --at <superstep>")
-    state = replay_state_at(events, target)
+    # The checkpoint file has the FULL state; the trace only carries a summary
+    # (summarize_state truncates long strings and lists). Prefer the file, and
+    # say so when falling back to the summary so nobody mistakes truncation
+    # for the real value (DESIGN.md §11.4).
+    state = _full_state_from_checkpoint(args.trace, target)
+    source = "checkpoint file"
+    if state is None:
+        state = replay_state_summary_at(events, target)
+        source = "trace summary (long values truncated)"
     if state is None:
         raise SystemExit(f"checkpoint not found in trace: {target}")
+    print(f"# full state from {source}")
     print(json.dumps(state, ensure_ascii=False, indent=2))
     return 0
+
+
+def _full_state_from_checkpoint(trace_path: str, checkpoint_id: str) -> dict[str, Any] | None:
+    """Read the complete state out of ``<trace_dir>/checkpoints/<id>.json``.
+
+    The trace stores summaries; only the checkpoint file has every value. The
+    path convention is the one :class:`CheckpointStore` writes — the trace's
+    sibling ``checkpoints/`` directory — and a missing file is normal (old
+    traces, or a checkpoint dir deleted on purpose), hence the ``None``.
+    """
+    trace_dir = os.path.dirname(trace_path) or "."
+    path = os.path.join(trace_dir, "checkpoints", f"{checkpoint_id}.json")
+    if not os.path.exists(path):
+        return None
+    with open(path, "r", encoding="utf-8") as fh:
+        return json.load(fh).get("state")
 
 
 def cmd_watch(args: argparse.Namespace) -> int:
@@ -143,6 +172,21 @@ def cmd_watch(args: argparse.Namespace) -> int:
     except KeyboardInterrupt:
         return 0
     return 0
+
+
+def cmd_diff(args: argparse.Namespace) -> int:
+    """Compare two traces after normalizing the fields that always change.
+
+    Exit code follows GNU diff: 1 means "differences found" (a signal, not a
+    failure), 0 means the two runs behaved identically after normalization.
+    """
+    from .compare import diff_traces, render_diff
+
+    events_a = _load(args.trace)
+    events_b = _load(args.trace_b)
+    diff = diff_traces(events_a, events_b)
+    print(render_diff(diff, palette=_palette(args), max_only=args.max_only))
+    return 1 if not diff.identical else 0
 
 
 def cmd_run(args: argparse.Namespace) -> int:
@@ -185,6 +229,7 @@ def cmd_serve(args: argparse.Namespace) -> int:
             host=args.host,
             port=args.port,
             follow=args.follow,
+            compare_path=args.trace_b,
         )
     except FileNotFoundError:
         raise SystemExit(f"no such trace: {args.trace}")
@@ -247,9 +292,19 @@ def build_parser() -> argparse.ArgumentParser:
     p_watch.add_argument("trace")
     p_watch.set_defaults(func=cmd_watch)
 
+    p_diff = sub.add_parser("diff", help="compare two traces")
+    _add_color_flag(p_diff)
+    p_diff.add_argument("trace")
+    p_diff.add_argument("trace_b")
+    p_diff.add_argument("--max-only", type=int, default=20,
+                        help="cap on listed only-a/only-b records")
+    p_diff.set_defaults(func=cmd_diff)
+
     p_serve = sub.add_parser("serve", help="render a trace in the browser")
     _add_color_flag(p_serve)
     p_serve.add_argument("trace")
+    p_serve.add_argument("trace_b", nargs="?", default=None,
+                         help="second trace: serve the comparison page")
     p_serve.add_argument("--host", default="127.0.0.1")
     p_serve.add_argument("--port", type=int, default=8000, help="0 picks a free port")
     p_serve.add_argument("--follow", action="store_true",

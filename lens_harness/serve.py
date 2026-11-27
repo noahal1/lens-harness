@@ -83,6 +83,7 @@ PING_AFTER_S = 15.0
 DISCONNECT_CHECK_S = 0.25
 
 _INDEX_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web", "index.html")
+_COMPARE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web", "compare.html")
 
 
 # --------------------------------------------------------------------------
@@ -254,6 +255,8 @@ class LensHandler(BaseHTTPRequestHandler):
     #: Shared, read-only after construction — set by :func:`make_server`.
     feed_path: str = ""
     feed_follow: bool = False
+    #: Second trace for the M3 comparison page; None means single-trace mode.
+    compare_path: str | None = None
     server_version = "lens-harness"
     protocol_version = "HTTP/1.1"  # the probe measured real streaming under this
 
@@ -336,6 +339,10 @@ class LensHandler(BaseHTTPRequestHandler):
         try:
             if path == "/":
                 self._serve_index()
+            elif path == "/compare":
+                self._serve_compare()
+            elif path == "/api/diff":
+                self._serve_api_diff()
             elif path == "/events":
                 self._serve_events()
             elif path == "/api/health":
@@ -424,6 +431,75 @@ class LensHandler(BaseHTTPRequestHandler):
             )
             return
         self._send_bytes(200, body, "text/html; charset=utf-8")
+
+    def _serve_compare(self) -> None:
+        if self.compare_path is None:
+            self._send_bytes(
+                404,
+                b"no comparison configured: start the server with two traces, "
+                b"e.g. `lens serve a.jsonl b.jsonl`",
+                "text/plain; charset=utf-8",
+            )
+            return
+        try:
+            with open(_COMPARE_PATH, "rb") as fh:
+                body = fh.read()
+        except FileNotFoundError:
+            self._send_bytes(
+                500,
+                f"compare page missing: {_COMPARE_PATH}\n".encode("utf-8"),
+                "text/plain; charset=utf-8",
+            )
+            return
+        self._send_bytes(200, body, "text/html; charset=utf-8")
+
+    def _serve_api_diff(self) -> None:
+        """The precomputed M3 comparison as one JSON document.
+
+        Computed per request from the two trace files: both are small by
+        design and a running `watch`/rerun may have rewritten them, so a
+        stale cached diff would lie about what the files hold *now*. 504
+        when no second trace was configured.
+        """
+        from .compare import diff_traces, normalize
+
+        if self.compare_path is None:
+            self._send_bytes(504, b"no second trace configured", "text/plain; charset=utf-8")
+            return
+        try:
+            from .events import read_trace
+
+            events_a = read_trace(self.feed_path)
+            events_b = read_trace(self.compare_path)
+        except (OSError, ValueError) as exc:
+            self._send_bytes(
+                500,
+                f"cannot read traces: {type(exc).__name__}: {exc}\n".encode("utf-8"),
+                "text/plain; charset=utf-8",
+            )
+            return
+
+        diff = diff_traces(events_a, events_b)
+        payload = {
+            "a": {"trace": os.path.basename(self.feed_path), "events": len(events_a),
+                  "records": len(normalize(events_a))},
+            "b": {"trace": os.path.basename(self.compare_path), "events": len(events_b),
+                  "records": len(normalize(events_b))},
+            "identical": diff.identical,
+            "entries": [
+                {
+                    "kind": e.kind,
+                    "key": [str(p) for p in e.key],
+                    "status": e.status,
+                    "changed_fields": e.changed_fields,
+                    "a": e.a,
+                    "b": e.b,
+                }
+                for e in diff.entries
+            ],
+        }
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        self._send_bytes(200, body, "application/json")
 
     # -- the stream --------------------------------------------------------
     def _client_after(self) -> int:
@@ -591,6 +667,7 @@ def make_server(
     host: str = DEFAULT_HOST,
     port: int = DEFAULT_PORT,
     follow: bool = False,
+    compare_path: str | None = None,
 ) -> ThreadingHTTPServer:
     """Build (do not start) a server for one trace file.
 
@@ -600,6 +677,11 @@ def make_server(
     ``event: error`` on a page that had already drawn a blank graph. Following
     is different: the run may not have created the trace yet, so a missing path
     is legal and the feed waits for it.
+
+    With ``compare_path`` the server additionally serves ``/compare`` — a
+    second page that renders the M3 diff of the two traces — and ``/api/diff``,
+    the precomputed comparison as JSON. Both traces must exist; a comparison of
+    a live file makes no sense (it would be stale before it rendered).
     """
     if not follow:
         if not os.path.isfile(trace_path) or not os.access(trace_path, os.R_OK):
@@ -607,10 +689,18 @@ def make_server(
                 f"no readable trace file at {trace_path}; serve an existing "
                 "trace or pass --follow to wait for one being written"
             )
+    if compare_path is not None and (
+        not os.path.isfile(compare_path) or not os.access(compare_path, os.R_OK)
+    ):
+        raise FileNotFoundError(f"no readable trace file at {compare_path} (the second trace)")
     handler = type(
         "BoundLensHandler",
         (LensHandler,),
-        {"feed_path": trace_path, "feed_follow": follow},
+        {
+            "feed_path": trace_path,
+            "feed_follow": follow,
+            "compare_path": compare_path,
+        },
     )
     httpd = ThreadingHTTPServer((host, port), handler)
     httpd.daemon_threads = True
@@ -623,14 +713,18 @@ def serve(
     host: str = DEFAULT_HOST,
     port: int = DEFAULT_PORT,
     follow: bool = False,
+    compare_path: str | None = None,
 ) -> int:
     """Serve until interrupted. Returns a process exit code."""
-    httpd = make_server(trace_path, host=host, port=port, follow=follow)
+    httpd = make_server(trace_path, host=host, port=port, follow=follow,
+                        compare_path=compare_path)
     actual_port = httpd.server_address[1]
     mode = "live (following the file)" if follow else "replay (finished trace)"
     print(f"lens serving {trace_path}")
     print(f"  mode : {mode}")
     print(f"  open : http://{host}:{actual_port}/")
+    if compare_path:
+        print(f"  diff : http://{host}:{actual_port}/compare  ({os.path.basename(compare_path)})")
     print("  stop : Ctrl-C")
     if host not in ("127.0.0.1", "localhost", "::1"):
         print(f"  WARNING: bound to {host}, not loopback — traces are visible on the network")
