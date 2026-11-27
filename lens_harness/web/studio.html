@@ -1,0 +1,166 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>lens studio</title>
+<!--
+  The studio workbench: a conversational panel on the left, the read-only
+  lens on the right (in an iframe — the lens stays a pure function of the
+  event prefix, per DESIGN §2; the studio is the *writer*, the lens the
+  *reader*). Single file, zero dependencies, like the other pages.
+-->
+<style>
+:root{
+  --bg:#0d1117; --panel:#161b22; --panel2:#1c2129; --line:#2d333b;
+  --fg:#e6edf3; --dim:#8b949e; --accent:#e0a12b; --accent2:#58a6ff;
+  --ok:#3fb950; --err:#f85149; --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);
+  font:14px/1.5 -apple-system,"Segoe UI",sans-serif;height:100vh;
+  display:flex;flex-direction:column;overflow:hidden}
+header{display:flex;align-items:center;gap:12px;padding:10px 16px;
+  background:var(--panel);border-bottom:1px solid var(--line);flex:none}
+.dot{width:10px;height:10px;border-radius:50%;background:var(--accent);
+  box-shadow:0 0 8px rgba(224,161,43,.55)}
+header h1{font-size:15px;margin:0;font-weight:600}
+header .chip{font:11px var(--mono);color:var(--dim);border:1px solid var(--line);
+  border-radius:10px;padding:1px 8px}
+header a{color:var(--accent2);text-decoration:none;font-size:12px;margin-left:auto}
+main{flex:1;display:flex;min-height:0}
+#left{width:44%;min-width:360px;display:flex;flex-direction:column;
+  border-right:1px solid var(--line);background:var(--panel)}
+#chat{flex:1;overflow-y:auto;padding:14px;display:flex;flex-direction:column;gap:10px}
+.msg{max-width:92%;border-radius:10px;padding:8px 12px;white-space:pre-wrap;
+  word-break:break-word;font-size:13px}
+.msg.user{align-self:flex-end;background:#1f3a5f;border:1px solid #2b4f7e}
+.msg.assistant{align-self:flex-start;background:var(--panel2);border:1px solid var(--line)}
+.msg.assistant.error{border-color:var(--err)}
+.msg code{font:12px var(--mono);color:var(--accent2)}
+.msg pre{margin:6px 0 0;padding:8px;background:#0d1117;border:1px solid var(--line);
+  border-radius:6px;overflow-x:auto;font:11.5px var(--mono)}
+form{display:flex;gap:8px;padding:12px;border-top:1px solid var(--line);flex:none}
+#cmd{flex:1;background:#0d1117;border:1px solid var(--line);border-radius:8px;
+  color:var(--fg);padding:9px 11px;font:13px var(--mono);resize:none;height:64px}
+#cmd:focus-visible{outline:2px solid var(--accent2);outline-offset:1px}
+button.run{background:var(--accent);border:none;border-radius:8px;color:#111;
+  font-weight:600;padding:0 16px;cursor:pointer}
+button.run:focus-visible{outline:2px solid var(--accent2);outline-offset:1px}
+#right{flex:1;display:flex;flex-direction:column;min-width:0}
+#right .bar{display:flex;align-items:center;gap:10px;padding:6px 12px;
+  border-bottom:1px solid var(--line);background:var(--panel);flex:none;
+  font:12px var(--mono);color:var(--dim)}
+#lens{flex:1;border:none;width:100%;background:var(--bg)}
+@media (prefers-reduced-motion: reduce){*{transition:none!important;animation:none!important}}
+</style>
+</head>
+<body>
+<header>
+  <div class="dot"></div>
+  <h1>lens studio</h1>
+  <span class="chip" id="chipSpec">no spec</span>
+  <span class="chip" id="chipRuns">0 runs</span>
+  <a href="/">read-only lens →</a>
+</header>
+<main>
+  <div id="left">
+    <div id="chat"></div>
+    <form id="f">
+      <textarea id="cmd" placeholder='{"cmd":"init","template":"llm_tool_loop"}&#10;{"cmd":"run","input":{"question":"what is 2+3"}}' spellcheck="false"></textarea>
+      <button class="run" id="send">Send</button>
+    </form>
+  </div>
+  <div id="right">
+    <div class="bar">
+      <span id="lensLabel">lens — latest trace</span>
+      <span id="lensTrace"></span>
+    </div>
+    <iframe id="lens" title="lens trace view"></iframe>
+  </div>
+</main>
+<script>
+"use strict";
+const chat = document.getElementById("chat");
+const lensFrame = document.getElementById("lens");
+
+const HELP =
+`命令逐行发送（JSON，一行一条），例如：
+{"cmd":"init","template":"llm_tool_loop"}   — 从模板建编排（sequential / llm_tool_loop / approval）
+{"cmd":"run","input":{"question":"what is 2+3"}}   — 编译并运行，右侧 lens 显示 trace
+{"cmd":"add_node","name":"n1","node":{"type":"transform","set":{"out":"hi {x}"}}}
+{"cmd":"set_edge","from":"agent","to":{"condition":"tool_call","then":{"tools":"tools","end":"__end__"}}}
+{"cmd":"set_entry","entry":"n1"}   {"cmd":"remove_node","name":"n1"}   {"cmd":"get_spec"}   {"cmd":"reset"}
+节点类型：llm · tool_loop · interrupt · python · transform · map · subgraph`;
+
+function add(role, text, extra) {
+  const div = document.createElement("div");
+  div.className = "msg " + role + (extra && extra.error ? " error" : "");
+  // fenced ```json blocks become <pre>; the rest keeps its line breaks
+  const parts = String(text).split(/```[a-z]*\n?/);
+  parts.forEach((p, i) => {
+    if (!p) return;
+    if (i % 2 === 1) {
+      const pre = document.createElement("pre");
+      pre.textContent = p.replace(/\n$/, "");
+      div.appendChild(pre);
+    } else {
+      div.appendChild(document.createTextNode(p));
+    }
+  });
+  chat.appendChild(div);
+  chat.scrollTop = chat.scrollHeight;
+}
+
+function refreshChips(res) {
+  document.getElementById("chipSpec").textContent =
+    res.spec ? res.spec.name + " · " + Object.keys(res.spec.nodes).length + " nodes" : "no spec";
+  document.getElementById("chipRuns").textContent =
+    (res.runs ? res.runs.length : 0) + " runs";
+}
+
+let lastTrace = null;
+function maybeLoadLens(res) {
+  if (res.trace && res.trace !== lastTrace) {
+    lastTrace = res.trace;
+    document.getElementById("lensTrace").textContent = "trace r_" + res.run_id;
+    lensFrame.src = "/?studio=" + encodeURIComponent(res.run_id);
+  }
+}
+
+async function send() {
+  const ta = document.getElementById("cmd");
+  const lines = ta.value.split("\n").map(l => l.trim()).filter(Boolean);
+  ta.value = "";
+  if (!lines.length) return;
+  for (const line of lines) {
+    let payload;
+    try { payload = JSON.parse(line); }
+    catch (e) {
+      add("assistant", "✗ 不是合法 JSON：" + e.message + "\n" + HELP, {error: true});
+      continue;
+    }
+    add("user", line);
+    try {
+      const r = await fetch("/api/studio", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify(payload),
+      });
+      const res = await r.json();
+      for (const m of res.messages || []) add(m.role === "user" ? "user" : "assistant", m.text, m);
+      refreshChips(res);
+      maybeLoadLens(res);
+    } catch (e) {
+      add("assistant", "✗ 请求失败：" + e.message, {error: true});
+    }
+  }
+}
+
+document.getElementById("f").addEventListener("submit", e => {
+  e.preventDefault(); send();
+});
+add("assistant", "lens studio 就绪。\n" + HELP);
+</script>
+</body>
+</html>

@@ -84,6 +84,7 @@ DISCONNECT_CHECK_S = 0.25
 
 _INDEX_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web", "index.html")
 _COMPARE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web", "compare.html")
+_STUDIO_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web", "studio.html")
 
 
 # --------------------------------------------------------------------------
@@ -341,6 +342,10 @@ class LensHandler(BaseHTTPRequestHandler):
                 self._serve_index()
             elif path == "/compare":
                 self._serve_compare()
+            elif path == "/studio":
+                self._serve_file(_STUDIO_PATH)
+            elif path == "/api/studio":
+                self._serve_api_studio()
             elif path == "/api/diff":
                 self._serve_api_diff()
             elif path == "/events":
@@ -453,6 +458,203 @@ class LensHandler(BaseHTTPRequestHandler):
             return
         self._send_bytes(200, body, "text/html; charset=utf-8")
 
+    def _serve_file(self, path: str) -> None:
+        """Serve a static package file (e.g. the studio page) verbatim."""
+        try:
+            with open(path, "rb") as fh:
+                body = fh.read()
+        except FileNotFoundError:
+            self._send_bytes(
+                500,
+                f"page missing: {path}\n"
+                "the package is incomplete; reinstall or restore lens_harness/web/"
+                .encode("utf-8"),
+                "text/plain; charset=utf-8",
+            )
+            return
+        self._send_bytes(200, body, "text/html; charset=utf-8")
+
+    def _serve_api_studio(self) -> None:
+        """One studio command per POST; the session lives on the server."""
+        from .studio import get_session
+
+        length = int(self.headers.get("Content-Length") or 0)
+        try:
+            payload = json.loads(self.rfile.read(length) or b"{}")
+        except (ValueError, UnicodeDecodeError) as exc:
+            self._send_bytes(400, f"bad JSON body: {exc}\n".encode("utf-8"),
+                             "text/plain; charset=utf-8")
+            return
+        result = get_session().handle(payload)
+        self._send_bytes(200, json.dumps(result, ensure_ascii=False).encode("utf-8"),
+                         "application/json; charset=utf-8")
+
+    def do_POST(self) -> None:  # noqa: N802 (stdlib naming)
+        """The one write entry: /api/studio (see DESIGN §10, Studio 边界)."""
+        if self._route_path() == "/api/studio":
+            try:
+                self._serve_api_studio()
+            except (BrokenPipeError, ConnectionAbortedError,
+                    ConnectionResetError):
+                return
+        else:
+            self._send_bytes(404, b"POST only on /api/studio",
+                             "text/plain; charset=utf-8")
+
+    def _serve_api_diff(self) -> None:
+        """The precomputed M3 comparison as one JSON document.
+
+        Computed per request from the two trace files: both are small by
+        design and a running `watch`/rerun may have rewritten them, so a
+        stale cached diff would lie about what the files hold *now*. 504
+        when no second trace was configured.
+        """
+        from .compare import diff_traces, normalize
+
+        if self.compare_path is None:
+            self._send_bytes(504, b"no second trace configured", "text/plain; charset=utf-8")
+            return
+        try:
+            from .events import read_trace
+
+            events_a = read_trace(self.feed_path)
+            events_b = read_trace(self.compare_path)
+        except (OSError, ValueError) as exc:
+            self._send_bytes(
+                500,
+                f"cannot read traces: {type(exc).__name__}: {exc}\n".encode("utf-8"),
+                "text/plain; charset=utf-8",
+            )
+            return
+
+        diff = diff_traces(events_a, events_b)
+        payload = {
+            "a": {"trace": os.path.basename(self.feed_path), "events": len(events_a),
+                  "records": len(normalize(events_a))},
+            "b": {"trace": os.path.basename(self.compare_path), "events": len(events_b),
+                  "records": len(normalize(events_b))},
+            "identical": diff.identical,
+            "entries": [
+                {
+                    "kind": e.kind,
+                    "key": [str(p) for p in e.key],
+                    "status": e.status,
+                    "changed_fields": e.changed_fields,
+                    "a": e.a,
+                    "b": e.b,
+                }
+                for e in diff.entries
+            ],
+        }
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        self._send_bytes(200, body, "application/json")
+
+    # -- the stream --------------------------------------------------------
+    def _client_after(self) -> int:
+        """Resume point: ``Last-Event-ID`` (browser reconnect) beats ``?after=``.
+
+        Parsed once per request and validated: a cursor the browser could not
+        have produced (``abc``, ``1e9``, ``-5``, ``+3``) is a client bug, not a
+        reason to silently replay the whole trace. ``ValueError`` carries the
+        message the caller turns into a 400.
+
+        A negative ``Last-Event-ID`` cannot come from ``EventSource`` (the ids we
+        send are always ``seq >= 0``), but ``?after=-1`` is the documented
+        "from the beginning" request, so it stays legal for the query parameter
+        only.
+        """
+        last = self.headers.get("Last-Event-ID")
+        if last is not None:
+            return _parse_cursor("Last-Event-ID: ", last, minimum=0)
+        query = self.path.split("?", 1)[1] if "?" in self.path else ""
+        for pair in query.split("&"):
+            key, _, value = pair.partition("=")
+            if key == "after":
+                return _parse_cursor("?after=", value, minimum=-1)
+        return -1
+
+    def _serve_health(self) -> None:
+        self._send_bytes(200, self._health_payload(), "application/json")
+
+    def _serve_index(self) -> None:
+        try:
+            with open(_INDEX_PATH, "rb") as fh:
+                body = fh.read()
+        except FileNotFoundError:
+            self._send_bytes(
+                500,
+                f"lens page missing: {_INDEX_PATH}\n"
+                "the package is incomplete; reinstall or restore lens_harness/web/"
+                .encode("utf-8"),
+                "text/plain; charset=utf-8",
+            )
+            return
+        self._send_bytes(200, body, "text/html; charset=utf-8")
+
+    def _serve_compare(self) -> None:
+        if self.compare_path is None:
+            self._send_bytes(
+                404,
+                b"no comparison configured: start the server with two traces, "
+                b"e.g. `lens serve a.jsonl b.jsonl`",
+                "text/plain; charset=utf-8",
+            )
+            return
+        try:
+            with open(_COMPARE_PATH, "rb") as fh:
+                body = fh.read()
+        except FileNotFoundError:
+            self._send_bytes(
+                500,
+                f"compare page missing: {_COMPARE_PATH}\n".encode("utf-8"),
+                "text/plain; charset=utf-8",
+            )
+            return
+        self._send_bytes(200, body, "text/html; charset=utf-8")
+
+    def _serve_file(self, path: str) -> None:
+        """Serve a static package file (e.g. the studio page) verbatim."""
+        try:
+            with open(path, "rb") as fh:
+                body = fh.read()
+        except FileNotFoundError:
+            self._send_bytes(
+                500,
+                f"page missing: {path}\n"
+                "the package is incomplete; reinstall or restore lens_harness/web/"
+                .encode("utf-8"),
+                "text/plain; charset=utf-8",
+            )
+            return
+        self._send_bytes(200, body, "text/html; charset=utf-8")
+
+    def _serve_api_studio(self) -> None:
+        """One studio command per POST; the session lives on the server."""
+        from .studio import get_session
+
+        length = int(self.headers.get("Content-Length") or 0)
+        try:
+            payload = json.loads(self.rfile.read(length) or b"{}")
+        except (ValueError, UnicodeDecodeError) as exc:
+            self._send_bytes(400, f"bad JSON body: {exc}\n".encode("utf-8"),
+                             "text/plain; charset=utf-8")
+            return
+        result = get_session().handle(payload)
+        self._send_bytes(200, json.dumps(result, ensure_ascii=False).encode("utf-8"),
+                         "application/json; charset=utf-8")
+
+    def do_POST(self) -> None:  # noqa: N802 (stdlib naming)
+        """The one write entry: /api/studio (see DESIGN §10, Studio 边界)."""
+        if self._route_path() == "/api/studio":
+            try:
+                self._serve_api_studio()
+            except (BrokenPipeError, ConnectionAbortedError,
+                    ConnectionResetError):
+                return
+        else:
+            self._send_bytes(404, b"POST only on /api/studio",
+                             "text/plain; charset=utf-8")
+
     def _serve_api_diff(self) -> None:
         """The precomputed M3 comparison as one JSON document.
 
@@ -534,6 +736,28 @@ class LensHandler(BaseHTTPRequestHandler):
             self._send_bytes(400, body, "text/plain; charset=utf-8")
             return
 
+        # Studio override: ?trace=<name> selects a run produced by the studio
+        # session instead of the trace bound at startup. Only a bare file name
+        # is accepted, resolved inside the studio trace dir — a query parameter
+        # must never become an arbitrary filesystem read (no `../`, no absolute
+        # paths). Unknown names 404 so a typo is visible, not silently empty.
+        feed_path = self.feed_path
+        qs = self.path.split("?", 1)
+        if len(qs) == 2:
+            from urllib.parse import parse_qs
+            want = (parse_qs(qs[1]).get("trace") or [None])[0]
+            if want:
+                from .studio import get_session
+                base = os.path.basename(want)
+                cand = os.path.join(get_session().trace_dir, base)
+                if not os.path.isfile(cand) and not base.endswith(".jsonl"):
+                    cand += ".jsonl"  # accept ?trace=r_x as shorthand for r_x.jsonl
+                if not os.path.isfile(cand):
+                    self._send_bytes(404, f"no such studio trace: {want}\n".encode("utf-8"),
+                                     "text/plain; charset=utf-8")
+                    return
+                feed_path = cand
+
         # A stream has no Content-Length, so it can only end by closing the
         # socket. HTTP/1.1 would otherwise leave this connection in keep-alive
         # and the client would hang after `done` waiting for more bytes.
@@ -552,8 +776,8 @@ class LensHandler(BaseHTTPRequestHandler):
             sse_event(
                 "meta",
                 {
-                    "trace": os.path.basename(self.feed_path),
-                    "path": self.feed_path,
+                    "trace": os.path.basename(feed_path),
+                    "path": feed_path,
                     "mode": mode,
                     "after": after,
                 },
@@ -571,7 +795,7 @@ class LensHandler(BaseHTTPRequestHandler):
         def produce() -> None:
             try:
                 for event in TraceFeed(
-                    self.feed_path,
+                    feed_path,
                     after=after,
                     follow=follow,
                     stop=stop,  # so a quiet poll is interrupted, not leaked

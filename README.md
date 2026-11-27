@@ -171,6 +171,8 @@ checkpoint DAG
 | `run <mod:attr> [--input JSON] [--trace-dir DIR] [--llm SPEC]` | 跑示例，写 trace 并渲染 |
 | `run --graph spec.json [--input JSON]` | 跑一个 JSON 编排的 agent（见「用 JSON 编排 agent」） |
 
+浏览器里还有第三页：`serve` 启动后访问 **`/studio`**——对话式编排工作台（左边结构化命令聊天，右边实时 lens），详见「Studio：浏览器里编排 agent」一节。
+
 下面的命令块里 `<trace>` 都换成你自己的那份 jsonl 路径（本文样例用 `traces/r_c22281d6.jsonl`）。
 
 `show` 的四个开关：
@@ -272,10 +274,12 @@ lens-harness/
 │   ├── checkpoint.py      # Checkpoint / CheckpointStore，时间旅行靠它
 │   ├── render.py          # ★ 纯函数渲染器：只吃 list[Event]
 │   ├── compare.py         # ★ M3 trace 对比：归一化 + 对齐 + diff（只 import events）
-│   ├── serve.py           # 把同一份 trace 用 SSE 推给浏览器（第 12 节）；双 trace 时加 /compare + /api/diff
+│   ├── studio.py          # ★ Studio：对话式编排会话（命令 → 改 spec → run_spec）
+│   ├── serve.py           # 把同一份 trace 用 SSE 推给浏览器（第 12 节）；双 trace 时加 /compare + /api/diff；另有 /studio + POST /api/studio
 │   ├── web/
 │   │   ├── index.html     # ★ 浏览器渲染器：单文件、零依赖、零构建
-│   │   └── compare.html   # ★ M3 对比页：吃 /api/diff 的 JSON，同样零依赖
+│   │   ├── compare.html   # ★ M3 对比页：吃 /api/diff 的 JSON，同样零依赖
+│   │   └── studio.html    # ★ Studio 工作台：左聊天右 lens（iframe 复用 index.html）
 │   ├── llm.py             # MockLLM / OpenAICompatibleLLM / RecordingLLM
 │   ├── cli.py             # 上面那九个子命令
 │   └── __init__.py        # 公开面（__version__ = "0.1.0"）
@@ -288,6 +292,7 @@ lens-harness/
 │   ├── test_serve.py      # 31 项，SSE 传输 + 页面纯度
 │   └── test_compare.py    # 8 项，M3 trace 对比契约
 │   └── test_dsl.py        # 20 项，JSON 编排 DSL 契约
+│   └── test_studio.py     # 8 项，Studio 会话契约（命令→内核，错误进聊天）
 ├── traces/                # 运行时产物
 │   ├── r_XXXXXXXX.jsonl   # 一份 trace（run_id = "r_" + uuid4 hex[:8]）
 │   └── checkpoints/       # <thread_id>_<superstep:04d>_<hex6>.json
@@ -781,6 +786,30 @@ spec 结构（完整示例见 `examples/calc-agent.json`、`examples/approval-fl
 
 已知限制：节点类型固定为上述四种（写路径扩展需先改 DESIGN §10）；`llm` 的消息格式
 固定为 `TOOL: name | arg` / `FINAL:`（与 `examples/agent.py` 相同的线协议）。
+
+## Studio：浏览器里编排 agent
+
+`serve` 启动后访问 **`/studio`**——左边对话流，右边实时 lens。对话里发的是**结构化
+JSON 命令**（一行一条，不是自然语言——这是 DESIGN §10 划定的边界），后端把命令落到
+JSON spec 上，每次运行都走普通内核路径（build_graph → Runtime → trace/checkpoints），
+右侧 iframe 复用只读 lens 显示生成的 trace：
+
+```jsonc
+{"cmd":"init","template":"llm_tool_loop"}      // 从模板建编排（sequential / llm_tool_loop / approval）
+{"cmd":"run","input":{"question":"what is 2+3"}} // 编译 + 运行，右侧 lens 立即显示这份 trace
+{"cmd":"add_node","name":"n1","node":{"type":"transform","set":{"out":"hi {x}"}}}
+{"cmd":"set_edge","from":"agent","to":{"condition":"tool_call","then":{"tools":"tools","end":"__end__"}}}
+{"cmd":"set_entry","entry":"n1"}    {"cmd":"remove_node","name":"n1"}
+{"cmd":"get_spec"}                  // 导出当前 spec（持久形态仍是 JSON 文件）
+{"cmd":"reset"}
+```
+
+要点：
+
+- **没有自己的执行器**——Studio 只是 `run_spec` 的远程面板，trace/checkpoint 与 CLI 完全同构；
+- 每条命令都会先编译，spec 错误（未知节点类型、边指向幽灵节点……）**原样回显到聊天流**，绝不静默降级；
+- 会话在进程内存里（单用户），服务重启即清空；
+- 依然没有认证——`/studio` 会写文件、跑代码引用的函数，只应在回环地址或可信网络里暴露。
 
 ## trace 对比（M3）
 

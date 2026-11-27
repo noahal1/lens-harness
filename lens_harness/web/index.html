@@ -1309,7 +1309,9 @@
   }
 
   function connect(after) {
+    var qs = new URLSearchParams(location.search).get("studio");
     var url = "/events" + (after >= 0 ? "?after=" + after : "");
+    if (qs) url += (url.indexOf("?") >= 0 ? "&" : "?") + "trace=" + encodeURIComponent(qs);
     if (!window.EventSource) {
       setConn("err", t("noSource"));
       return;

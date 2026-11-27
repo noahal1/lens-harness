@@ -755,9 +755,19 @@ self.emitter.emit(
 
 **仍然不做的**：
 
-- **不做写操作**：页面不能运行图、不能 resume、不能改 checkpoint、不能提交中断的审批。它只有一个方向——trace → 屏幕。所有 `POST` 都没有，`serve.py` 也只注册了 `do_GET`。
+- ~~**不做写操作**~~（Studio 之后收窄，见下节）主 lens 页面仍然是只读的：不能运行图、不能 resume、不能改 checkpoint、不能提交中断的审批。它只有一个方向——trace → 屏幕。
 - **不做通用 Web 应用**：没有账号、没有会话、没有多用户、没有 WebSocket（要实时就用浏览器原生的 `EventSource`）。
 - **不做前端工程化**：不引 React/Vue/Svelte，不引打包器，不引 TypeScript，不引测试框架。理由是原则二——如果画一个 trace 需要先装 300MB 依赖，那这个项目的可读性就没了。
+
+### Studio 的写路径边界（Studio 之后新增）
+
+`/studio` 是一个**新的写入口**，与只读 lens 并存，边界如下：
+
+- **做了**：一个单用户、单会话的编排工作台——左侧对话流（结构化命令：初始化模板、增删改节点/边、设置入口、运行），后端把命令落到 JSON spec 上、每次运行都走**普通内核路径**（build_graph → Runtime → trace/checkpoints），右侧用 iframe 复用只读 lens 看生成的 trace。命令错误（未知通道、环路、无法编译的 spec）原样回显到对话流，不静默降级。
+- **仍然不做**：自然语言理解——聊天是结构化命令，不是 chatbot；把「改节点」翻译成自然语言是另一个项目的事。对话消息不进 LLM。
+- **仍然不做**：多用户/持久化会话——Studio 会话在进程内存里，服务重启即清空；spec 的持久形态仍是 JSON 文件（可从对话流复制导出）。
+- **仍然不做**：绕过内核——Studio 没有自己的执行器，它只是 `run_spec` 的一个远程面板；trace、checkpoint、diff 与 CLI 完全同构。
+- 依然没有认证：Studio 只应绑定在回环地址或可信网络里运行。
 ### 不做任意 trace 的合并视图（M3 之后收窄）
 
 这条**曾被写成「不做多 trace」，M3 之后需要重新划界**——`lens diff` 与 `serve a.jsonl b.jsonl` 已经存在（第 13 节）。边界现在是：
