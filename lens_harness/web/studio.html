@@ -1,14 +1,18 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="zh">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>lens studio</title>
+<title>lens studio — 可视化编排工作台</title>
 <!--
   The studio workbench: a conversational panel on the left, the read-only
   lens on the right (in an iframe — the lens stays a pure function of the
   event prefix, per DESIGN §2; the studio is the *writer*, the lens the
   *reader*). Single file, zero dependencies, like the other pages.
+
+  Guided mode: the common actions are one-click buttons and small forms that
+  assemble the same JSON commands the raw mode sends — the wire format is
+  unchanged, so the backend boundary (DESIGN §10) still holds.
 -->
 <style>
 :root{
@@ -18,8 +22,8 @@
 }
 *{box-sizing:border-box}
 body{margin:0;background:var(--bg);color:var(--fg);
-  font:14px/1.5 -apple-system,"Segoe UI",sans-serif;height:100vh;
-  display:flex;flex-direction:column;overflow:hidden}
+  font:14px/1.5 -apple-system,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;
+  height:100vh;display:flex;flex-direction:column;overflow:hidden}
 header{display:flex;align-items:center;gap:12px;padding:10px 16px;
   background:var(--panel);border-bottom:1px solid var(--line);flex:none}
 .dot{width:10px;height:10px;border-radius:50%;background:var(--accent);
@@ -29,7 +33,7 @@ header .chip{font:11px var(--mono);color:var(--dim);border:1px solid var(--line)
   border-radius:10px;padding:1px 8px}
 header a{color:var(--accent2);text-decoration:none;font-size:12px;margin-left:auto}
 main{flex:1;display:flex;min-height:0}
-#left{width:44%;min-width:360px;display:flex;flex-direction:column;
+#left{width:46%;min-width:380px;display:flex;flex-direction:column;
   border-right:1px solid var(--line);background:var(--panel)}
 #chat{flex:1;overflow-y:auto;padding:14px;display:flex;flex-direction:column;gap:10px}
 .msg{max-width:92%;border-radius:10px;padding:8px 12px;white-space:pre-wrap;
@@ -37,12 +41,29 @@ main{flex:1;display:flex;min-height:0}
 .msg.user{align-self:flex-end;background:#1f3a5f;border:1px solid #2b4f7e}
 .msg.assistant{align-self:flex-start;background:var(--panel2);border:1px solid var(--line)}
 .msg.assistant.error{border-color:var(--err)}
-.msg code{font:12px var(--mono);color:var(--accent2)}
+.msg b{color:var(--accent)}
 .msg pre{margin:6px 0 0;padding:8px;background:#0d1117;border:1px solid var(--line);
   border-radius:6px;overflow-x:auto;font:11.5px var(--mono)}
-form{display:flex;gap:8px;padding:12px;border-top:1px solid var(--line);flex:none}
+/* guided toolbar */
+#toolbar{flex:none;border-top:1px solid var(--line);padding:10px 12px 6px;
+  display:flex;flex-direction:column;gap:8px;background:var(--panel2)}
+.trow{display:flex;gap:6px;flex-wrap:wrap;align-items:center}
+.trow .lbl{font-size:11px;color:var(--dim);width:52px;flex:none}
+button.act{background:#21262d;border:1px solid var(--line);border-radius:8px;
+  color:var(--fg);font-size:12px;padding:4px 10px;cursor:pointer}
+button.act:hover{border-color:var(--accent2);color:var(--accent2)}
+button.act.primary{background:var(--accent);border-color:var(--accent);color:#111;font-weight:600}
+button.act:focus-visible{outline:2px solid var(--accent2);outline-offset:1px}
+#quickInput{flex:1;background:#0d1117;border:1px solid var(--line);border-radius:6px;
+  color:var(--fg);padding:4px 8px;font:12px var(--mono);min-width:120px}
+#quickInput:focus-visible{outline:2px solid var(--accent2);outline-offset:1px}
+/* raw command form */
+form{display:flex;gap:8px;padding:8px 12px 12px;flex:none}
+details.raw{border-top:1px dashed var(--line);padding-top:4px}
+details.raw summary{font-size:11px;color:var(--dim);cursor:pointer;padding:4px 0}
+details.raw summary:hover{color:var(--accent2)}
 #cmd{flex:1;background:#0d1117;border:1px solid var(--line);border-radius:8px;
-  color:var(--fg);padding:9px 11px;font:13px var(--mono);resize:none;height:64px}
+  color:var(--fg);padding:9px 11px;font:12.5px var(--mono);resize:none;height:56px}
 #cmd:focus-visible{outline:2px solid var(--accent2);outline-offset:1px}
 button.run{background:var(--accent);border:none;border-radius:8px;color:#111;
   font-weight:600;padding:0 16px;cursor:pointer}
@@ -59,21 +80,35 @@ button.run:focus-visible{outline:2px solid var(--accent2);outline-offset:1px}
 <header>
   <div class="dot"></div>
   <h1>lens studio</h1>
-  <span class="chip" id="chipSpec">no spec</span>
-  <span class="chip" id="chipRuns">0 runs</span>
-  <a href="/">read-only lens →</a>
+  <span class="chip" id="chipSpec">未创建</span>
+  <span class="chip" id="chipRuns">0 次运行</span>
+  <a href="/">只读 lens →</a>
 </header>
 <main>
   <div id="left">
     <div id="chat"></div>
-    <form id="f">
-      <textarea id="cmd" placeholder='{"cmd":"init","template":"llm_tool_loop"}&#10;{"cmd":"run","input":{"question":"what is 2+3"}}' spellcheck="false"></textarea>
-      <button class="run" id="send">Send</button>
-    </form>
+    <div id="toolbar">
+      <div class="trow" id="tplRow"><span class="lbl">① 选模板</span></div>
+      <div class="trow"><span class="lbl">② 输入</span>
+        <input id="quickInput" placeholder="运行输入（可留空用默认）" spellcheck="false">
+        <button class="act primary" id="quickRun">▶ 运行</button>
+      </div>
+      <div class="trow"><span class="lbl">③ 查看</span>
+        <button class="act" id="quickSpec">看当前编排 JSON</button>
+        <button class="act" id="quickHelp">怎么玩？</button>
+      </div>
+      <details class="raw">
+        <summary>高级：直接发 JSON 命令（改节点 / 改边 / 删除…）</summary>
+        <form id="f">
+          <textarea id="cmd" placeholder='{"cmd":"add_node","name":"n1","node":{"type":"transform","set":{"out":"hi {x}"}}}' spellcheck="false"></textarea>
+          <button class="run" id="send">发送</button>
+        </form>
+      </details>
+    </div>
   </div>
   <div id="right">
     <div class="bar">
-      <span id="lensLabel">lens — latest trace</span>
+      <span id="lensLabel">lens — 最近一次运行</span>
       <span id="lensTrace"></span>
     </div>
     <iframe id="lens" title="lens trace view"></iframe>
@@ -85,19 +120,26 @@ const chat = document.getElementById("chat");
 const lensFrame = document.getElementById("lens");
 
 const HELP =
-`命令逐行发送（JSON，一行一条），例如：
-{"cmd":"init","template":"llm_tool_loop"}   — 从模板建编排（sequential / llm_tool_loop / approval）
-{"cmd":"run","input":{"question":"what is 2+3"}}   — 编译并运行，右侧 lens 显示 trace
+`三步上手：
+① 点「选模板」里的一个按钮创建编排（鼠标停在按钮上有说明）
+② 输入框填运行输入（留空就用模板默认值），点「▶ 运行」
+③ 右边 lens 实时播放这次运行：图上节点亮起表示正在执行，
+   状态面板显示每个通道的值怎么变。
+
+想自己改编排？展开「高级」发 JSON 命令，例如：
 {"cmd":"add_node","name":"n1","node":{"type":"transform","set":{"out":"hi {x}"}}}
-{"cmd":"set_edge","from":"agent","to":{"condition":"tool_call","then":{"tools":"tools","end":"__end__"}}}
-{"cmd":"set_entry","entry":"n1"}   {"cmd":"remove_node","name":"n1"}   {"cmd":"get_spec"}   {"cmd":"reset"}
-节点类型：llm · tool_loop · interrupt · python · transform · map · subgraph`;
+{"cmd":"set_edge","from":"a","to":"n1"}   {"cmd":"set_entry","entry":"n1"}
+节点类型 7 种：llm（模型调用）· tool_loop（工具循环）· interrupt（人工审批）
+· python（自定义函数）· transform（模板改写）· map（逐项处理列表）· subgraph（嵌套子编排）`;
 
 function add(role, text, extra) {
   const div = document.createElement("div");
   div.className = "msg " + role + (extra && extra.error ? " error" : "");
+  const escaped = String(text)
+    .replace(/&/g, "&amp;").replace(/</g, "&lt;")
+    .replace(/\*\*(.+?)\*\*/g, "<b>$1</b>");
   // fenced ```json blocks become <pre>; the rest keeps its line breaks
-  const parts = String(text).split(/```[a-z]*\n?/);
+  const parts = escaped.split(/```[a-z]*\n?/);
   parts.forEach((p, i) => {
     if (!p) return;
     if (i % 2 === 1) {
@@ -105,7 +147,9 @@ function add(role, text, extra) {
       pre.textContent = p.replace(/\n$/, "");
       div.appendChild(pre);
     } else {
-      div.appendChild(document.createTextNode(p));
+      const span = document.createElement("span");
+      span.innerHTML = p;
+      div.appendChild(span);
     }
   });
   chat.appendChild(div);
@@ -114,9 +158,9 @@ function add(role, text, extra) {
 
 function refreshChips(res) {
   document.getElementById("chipSpec").textContent =
-    res.spec ? res.spec.name + " · " + Object.keys(res.spec.nodes).length + " nodes" : "no spec";
+    res.spec ? res.spec.name + " · " + Object.keys(res.spec.nodes).length + " 节点" : "未创建";
   document.getElementById("chipRuns").textContent =
-    (res.runs ? res.runs.length : 0) + " runs";
+    (res.runs ? res.runs.length : 0) + " 次运行";
 }
 
 let lastTrace = null;
@@ -128,11 +172,16 @@ function maybeLoadLens(res) {
   }
 }
 
-async function send() {
-  const ta = document.getElementById("cmd");
-  const lines = ta.value.split("\n").map(l => l.trim()).filter(Boolean);
-  ta.value = "";
-  if (!lines.length) return;
+async function api(payload) {
+  const r = await fetch("/api/studio", {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify(payload),
+  });
+  return r.json();
+}
+
+async function sendRaw(lines) {
   for (const line of lines) {
     let payload;
     try { payload = JSON.parse(line); }
@@ -142,12 +191,7 @@ async function send() {
     }
     add("user", line);
     try {
-      const r = await fetch("/api/studio", {
-        method: "POST",
-        headers: {"Content-Type": "application/json"},
-        body: JSON.stringify(payload),
-      });
-      const res = await r.json();
+      const res = await api(payload);
       for (const m of res.messages || []) add(m.role === "user" ? "user" : "assistant", m.text, m);
       refreshChips(res);
       maybeLoadLens(res);
@@ -157,10 +201,50 @@ async function send() {
   }
 }
 
-document.getElementById("f").addEventListener("submit", e => {
-  e.preventDefault(); send();
+/* ---- guided toolbar ---- */
+async function buildTemplateButtons() {
+  try {
+    const res = await api({cmd: "templates"});
+    const row = document.getElementById("tplRow");
+    for (const [name, t] of Object.entries(res.templates || {})) {
+      const b = document.createElement("button");
+      b.className = "act";
+      b.textContent = name;
+      b.title = t.desc + "\n默认输入: " + JSON.stringify(t.input);
+      b.addEventListener("click", () => {
+        document.getElementById("quickInput").value =
+          t.input ? JSON.stringify(t.input) : "";
+        sendRaw([JSON.stringify({cmd: "init", template: name})]);
+      });
+      row.appendChild(b);
+    }
+  } catch (e) { /* toolbar stays raw-only if templates listing fails */ }
+}
+document.getElementById("quickRun").addEventListener("click", () => {
+  const raw = document.getElementById("quickInput").value.trim();
+  const payload = {cmd: "run"};
+  if (raw) {
+    try { payload.input = JSON.parse(raw); }
+    catch (e) { payload.input = {"question": raw}; }  // bare text → question
+  }
+  sendRaw([JSON.stringify(payload)]);
 });
-add("assistant", "lens studio 就绪。\n" + HELP);
+document.getElementById("quickSpec").addEventListener("click",
+  () => sendRaw(['{"cmd":"get_spec"}']));
+document.getElementById("quickHelp").addEventListener("click",
+  () => add("assistant", HELP));
+
+/* ---- raw form ---- */
+document.getElementById("f").addEventListener("submit", e => {
+  e.preventDefault();
+  const ta = document.getElementById("cmd");
+  const lines = ta.value.split("\n").map(l => l.trim()).filter(Boolean);
+  ta.value = "";
+  sendRaw(lines);
+});
+
+add("assistant", "欢迎来到 lens studio！**三步**就能跑起来，点下面的模板按钮开始。\n" + HELP);
+buildTemplateButtons();
 </script>
 </body>
 </html>

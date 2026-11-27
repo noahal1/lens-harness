@@ -38,14 +38,26 @@ NODE_TYPES = ("llm", "tool_loop", "interrupt", "python",
               "transform", "map", "subgraph")
 
 _TEMPLATES: dict[str, dict[str, Any]] = {
+    "sequential": {
+        "desc": "流水线：数据从入口节点一路改写到最后，最简单的入门模板",
+        "input": {"x": "hello"},
+        "name": "studio-flow",
+        "state": {"x": "str", "out": "str"},
+        "nodes": {"a": {"type": "transform", "set": {"out": "got: {x}"}}},
+        "entry": "a",
+        "edges": {"a": "__end__"},
+    },
     "llm_tool_loop": {
+        "desc": "会算数的 agent：模型想用计算器就调工具，拿到结果继续想，直到给出最终答案",
+        "input": {"question": "17*23"},
+        "llm": {"replies": ["Let me compute that. TOOL: calculator | 17*23",
+                            "FINAL: computed."]},
+        "tools": {"calculator": "builtin:calculator"},
         "name": "studio-agent",
         "state": {"question": "str",
                   "messages": ["list[dict[str, str]]", "add"],
                   "answer": "str", "steps": "int",
                   "tools_used": ["list[str]", "add_unique"]},
-        "llm": {"replies": ["TOOL: calculator | 2+3", "FINAL: computed."]},
-        "tools": {"calculator": "builtin:calculator"},
         "nodes": {"agent": {"type": "llm", "system": "You compute things."},
                   "tools": {"type": "tool_loop"}},
         "entry": "agent",
@@ -53,14 +65,9 @@ _TEMPLATES: dict[str, dict[str, Any]] = {
                             "then": {"tools": "tools", "end": "__end__"}},
                   "tools": "agent"},
     },
-    "sequential": {
-        "name": "studio-flow",
-        "state": {"x": "str", "out": "str"},
-        "nodes": {"a": {"type": "transform", "set": {"out": "got: {x}"}}},
-        "entry": "a",
-        "edges": {"a": "__end__"},
-    },
     "approval": {
+        "desc": "人工审批：跑到关键步骤会暂停等你在界面上确认，批准后才继续执行",
+        "input": {"action": "delete prod db"},
         "name": "studio-approval",
         "state": {"action": "str", "decision": "str", "log": ["list[str]", "add"]},
         "nodes": {"gate": {"type": "interrupt", "question": "Approve?",
@@ -82,6 +89,7 @@ class StudioSession:
         self.spec: dict[str, Any] | None = None
         self.messages: list[dict[str, str]] = []
         self.runs: list[dict[str, Any]] = []
+        self.default_input: dict[str, Any] = {}
 
     # -- chat ------------------------------------------------------------
     def say(self, role: str, text: str, extra: dict | None = None) -> dict:
@@ -125,12 +133,23 @@ class StudioSession:
         if name not in _TEMPLATES:
             raise ValueError(f"未知模板 {name!r}；可用：{sorted(_TEMPLATES)}")
         import copy
-        self.spec = copy.deepcopy(_TEMPLATES[name])
+        spec = copy.deepcopy(_TEMPLATES[name])
+        # desc / input are studio metadata, not spec fields — keep them out of
+        # the JSON the user exports, or build_graph would reject the unknown keys.
+        desc, default_input = spec.pop("desc", ""), spec.pop("input", {})
+        self.default_input = default_input
+        self.spec = spec
         self.runs = []
         self.say("user", f"init template={name}")
-        return self._ok(f"✓ 已创建编排 {self.spec['name']!r}"
-                        f"（模板 {name}）：{len(self.spec['nodes'])} 个节点。"
-                        "可以用 add_node / set_edge 修改，或直接 run。")
+        note = f"✓ 已创建编排：**{name}**\n{desc}\n（{len(spec['nodes'])} 个节点，入口 {spec['entry']}）"
+        return self._ok(note)
+
+    def _cmd_templates(self, payload: dict) -> dict:
+        """List the built-in templates with descriptions — for the UI buttons."""
+        listing = {name: {"desc": t.get("desc", ""), "input": t.get("input", {})}
+                   for name, t in _TEMPLATES.items()}
+        return {"ok": True, "templates": listing, "spec": self.spec,
+                "runs": self.runs}
 
     def _cmd_reset(self, payload: dict) -> dict:
         self.spec = None
@@ -226,7 +245,7 @@ class StudioSession:
 
     def _cmd_run(self, payload: dict) -> dict:
         spec = self._require_spec()
-        inputs = payload.get("input") or {}
+        inputs = payload.get("input") or self.default_input or {}
         self.say("user", f"run input={json.dumps(inputs, ensure_ascii=False)}")
         os.makedirs(self.trace_dir, exist_ok=True)
         from .events import ListSink
