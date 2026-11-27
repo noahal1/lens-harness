@@ -353,16 +353,17 @@
   <span class="gname" id="gname">—</span>
   <span class="meta" id="runmeta"></span>
   <span class="spacer"></span>
-  <span class="chip" id="conn"><span class="dot"></span><span id="connTxt">connecting</span></span>
-  <span class="chip" data-status="waiting" id="status">waiting</span>
-  <span class="chip" id="count">0 events</span>
+  <button class="chip" id="lang" title="switch language / 切换语言" style="cursor:pointer"></button>
+  <span class="chip" id="conn"><span class="dot"></span><span id="connTxt"></span></span>
+  <span class="chip" data-status="waiting" id="status"></span>
+  <span class="chip" id="count"></span>
 </header>
 
 <main>
   <section class="panel">
     <div class="panel-head">
-      <span>graph</span>
-      <span class="right" id="graphNote">waiting for run_start…</span>
+      <span id="lblGraph">graph</span>
+      <span class="right" id="graphNote"></span>
     </div>
     <div id="graphWrap"><svg id="graph" preserveAspectRatio="xMidYMid meet"></svg></div>
     <div id="legend"></div>
@@ -370,7 +371,7 @@
 
   <section class="panel">
     <div class="panel-head">
-      <span>inspector</span>
+      <span id="lblInspector">inspector</span>
       <span class="right" id="inspectorNote"></span>
     </div>
     <div class="tabs" role="tablist">
@@ -382,11 +383,11 @@
     </div>
     <div id="inspector">
       <div id="banners"></div>
-      <div class="pane on" data-pane="state"><div class="empty">no state yet</div></div>
-      <div class="pane" data-pane="diff"></div>
+      <div class="pane on" data-pane="state"><div class="empty" id="emptyState"></div></div>
+      <div class="pane" data-pane="diff"><div class="empty" id="emptyMerge"></div></div>
       <div class="pane" data-pane="writes"></div>
       <div class="pane" data-pane="events"><div class="evlist" id="evlist"></div></div>
-      <div class="pane" data-pane="cps"><div id="cplist"><div class="empty">no checkpoints yet</div></div></div>
+      <div class="pane" data-pane="cps"><div id="cplist"><div class="empty" id="emptyCps"></div></div></div>
     </div>
   </section>
 </main>
@@ -401,9 +402,10 @@
     <span class="pos" id="pos"></span>
     <button class="ctl" id="live" title="follow the tip (l)">live</button>
   </div>
-  <div class="hint">
-    <kbd>←</kbd><kbd>→</kbd> step &nbsp; <kbd>space</kbd> play &nbsp; <kbd>l</kbd> follow tip
-    &nbsp;·&nbsp; everything below is a pure function of the event prefix
+  <div class="hint" id="hint">
+    <kbd>←</kbd><kbd>→</kbd> <span id="lblStep"></span> &nbsp; <kbd>space</kbd> <span id="lblPlay"></span>
+    &nbsp; <kbd>l</kbd> <span id="lblTip"></span>
+    &nbsp;·&nbsp; <span id="lblPure"></span>
   </div>
 </footer>
 
@@ -412,6 +414,109 @@
 <script>
 (function () {
   "use strict";
+
+  /* ==================================================================== *
+   *  0. i18n — every UI string goes through t().  English / 中文.
+   *     The choice persists in localStorage; default follows the browser.
+   *     Data strings (node names, channel names, statuses straight from
+   *     the kernel) are NOT translated — only chrome copy is.
+   * ==================================================================== */
+  var I18N = {
+    en: {
+      connecting: "connecting", noSource: "no EventSource", reconnecting: "reconnecting…",
+      replayDone: "replay complete",
+      waiting: "waiting",
+      graph: "graph", inspector: "inspector",
+      graphWaiting: "waiting for run_start…",
+      nodesChannels: function (n, c) { return n + " nodes · " + c + " channels"; },
+      tabState: "state", tabDiff: "diff", tabWrites: "writes", tabEvents: "events", tabCps: "checkpoints",
+      noStateYet: "no state yet",
+      noStateYetFull: "no state yet — waiting for run_start / state_merge",
+      channelsAt: function (s) { return "channels at seq " + s; },
+      fullState: "full state",
+      noMergeYet: "no state_merge at or before this point — nothing has been reduced yet",
+      changed: "changed", before: "BEFORE", after: "AFTER",
+      rawPatches: "raw patches from this superstep",
+      noSuperstep: "no superstep yet",
+      noNodeFinished: "no node has finished in this superstep yet",
+      moreChunks: function (n) { return "…(" + n + " more chunks)"; },
+      more: function (n) { return "…(" + n + " more)"; },
+      noCpsYet: "no checkpoints yet",
+      interruptedAt: "interrupted", atNode: "at node",
+      approveWith: "resume payload (checkpoint id)",
+      nodeFailed: "failed:",
+      reportedProblem: "reported:",
+      reducedAt: function (s) { return "reduced at seq " + s; },
+      waitingSuperstep: "waiting for a superstep",
+      events: function (n, m) { return n + " / " + m + " events"; },
+      seq: "seq", live: "live",
+      step: "step", play: "play", followTip: "follow tip",
+      pureNote: "everything below is a pure function of the event prefix",
+      waitingHuman: " · waiting for a human",
+      entry: " · entry ",
+      wrote: " · wrote ",
+      changedColon: "changed ",
+      staticEdge: " (static)",
+      supersteps: " supersteps",
+      condEdge: "— — conditional edge",
+      langLabel: "EN"
+    },
+    zh: {
+      connecting: "连接中", noSource: "不支持 EventSource", reconnecting: "重连中…",
+      replayDone: "回放完成",
+      waiting: "等待中",
+      graph: "图", inspector: "检查器",
+      graphWaiting: "等待 run_start…",
+      nodesChannels: function (n, c) { return n + " 个节点 · " + c + " 个通道"; },
+      tabState: "状态", tabDiff: "差异", tabWrites: "写入", tabEvents: "事件", tabCps: "检查点",
+      noStateYet: "暂无状态",
+      noStateYetFull: "暂无状态——等待 run_start / state_merge",
+      channelsAt: function (s) { return "序列 " + s + " 处的通道"; },
+      fullState: "完整状态",
+      noMergeYet: "此前没有 state_merge——还没有任何归并发生",
+      changed: "变更", before: "之前", after: "之后",
+      rawPatches: "本 superstep 的原始补丁",
+      noSuperstep: "还没有 superstep",
+      noNodeFinished: "本 superstep 还没有节点执行完成",
+      moreChunks: function (n) { return "…(还有 " + n + " 个分块)"; },
+      more: function (n) { return "…(还有 " + n + " 字符)"; },
+      noCpsYet: "暂无检查点",
+      interruptedAt: "已中断", atNode: "于节点",
+      approveWith: "恢复载荷（checkpoint id）",
+      nodeFailed: "失败：",
+      reportedProblem: "上报问题：",
+      reducedAt: function (s) { return "归并于序列 " + s; },
+      waitingSuperstep: "等待一个 superstep",
+      events: function (n, m) { return "事件 " + n + " / " + m; },
+      seq: "序列", live: "实时",
+      step: "步进", play: "播放", followTip: "跟随最新",
+      pureNote: "以下一切内容都是事件前缀的纯函数",
+      waitingHuman: " · 等待人工处理",
+      entry: " · 入口 ",
+      wrote: " · 写入 ",
+      changedColon: "变更 ",
+      staticEdge: "（静态边）",
+      supersteps: " 个 superstep",
+      condEdge: "— — 条件边",
+      langLabel: "中"
+    }
+  };
+
+  var LANG = null;
+  function t(key) {
+    if (!LANG) {
+      try { LANG = localStorage.getItem("lens-lang"); } catch (e) {}
+      if (LANG !== "zh" && LANG !== "en") {
+        LANG = (navigator.language || "").toLowerCase().indexOf("zh") === 0 ? "zh" : "en";
+      }
+    }
+    var v = I18N[LANG][key];
+    return v === undefined ? I18N.en[key] : v;
+  }
+  function tLang() {
+    t("connecting"); /* force LANG init */
+    return LANG;
+  }
 
   /* ==================================================================== *
    *  1. derive(): events + cursor -> view model.  Pure. No DOM access.
@@ -697,7 +802,7 @@
     else { try { s = JSON.stringify(v); } catch (e) { s = String(v); } }
     if (s === undefined) s = "undefined";
     max = max || 220;
-    return s.length > max ? s.slice(0, max) + " …(" + (s.length - max) + " more)" : s;
+    return s.length > max ? s.slice(0, max) + " " + t("more")(s.length - max) : s;
   }
 
   function fmtMs(ms) {
@@ -714,7 +819,7 @@
     var st = $("#status");
     st.textContent = vm.status;
     st.setAttribute("data-status", vm.status);
-    $("#count").textContent = vm.nApplied + " / " + total + " events";
+    $("#count").textContent = t("events")(vm.nApplied, total);
   }
 
   /* ---- graph ---- */
@@ -887,9 +992,9 @@
               '<span><i style="background:#e0a83c"></i>side-effect</span>',
               '<span><i style="background:#cf8ad0"></i>human</span>',
               '<span><i style="background:#9a86e8"></i>policy</span>',
-              '<span class="lg-taken">— — conditional edge</span>'];
+              '<span class="lg-taken">' + t("condEdge") + "</span>"];
     $("#legend").innerHTML = lg.join("");
-    $("#graphNote").textContent = (g.nodes || []).length + " nodes · " + (g.channels || []).length + " channels";
+    $("#graphNote").textContent = t("nodesChannels")((g.nodes || []).length, (g.channels || []).length);
   }
 
   var HOT_EDGES = {};
@@ -972,43 +1077,41 @@
       html.push('<div class="v">' + colorize(compact(vm.state[k], 400)) + "</div>");
     });
     html.push("</div>");
-    html.push("<h4>full state</h4><pre class=\"blk\">" + colorize(pretty(vm.state)) + "</pre>");
+    html.push("<h4>" + t("fullState") + "</h4><pre class=\"blk\">" + colorize(pretty(vm.state)) + "</pre>");
     host.innerHTML = html.join("");
   }
 
   function paneDiff(vm) {
     var host = document.querySelector('[data-pane="diff"]');
     if (!vm.diff) {
-      host.innerHTML = '<div class="empty">no state_merge at or before this point — nothing has been reduced yet</div>';
+      host.innerHTML = '<div class="empty">' + t("noMergeYet") + "</div>";
       return;
     }
     var html = [];
-    html.push('<h4>reducer output of superstep ' + (vm.lastMerge ? vm.lastMerge.superstep : "?") +
-              " (event seq " + (vm.lastMerge ? vm.lastMerge.seq : "?") + ")</h4>");
+    html.push("<h4>" + t("rawPatches") + "</h4>");
     var chans = Object.keys(vm.diff);
-    if (!chans.length) html.push('<div class="empty">state_merge with no changed channels</div>');
+    if (!chans.length) html.push('<div class="empty">' + t("changedColon") + "</div>");
     chans.forEach(function (c) {
       var d = vm.diff[c] || {};
-      html.push('<div class="drow"><div class="dh"><span>' + esc(c) + '</span>' +
-                '<span class="red">' + (vm.changed.indexOf(c) >= 0 ? "reduced" : "") + "</span></div>");
+      html.push('<div class="drow"><div class="dh"><span>' + esc(c) + "</span>" +
+                '<span class="red">' + (vm.changed.indexOf(c) >= 0 ? t("changed") : "") + "</span></div>");
       html.push('<div class="ba">');
       /* ``before``/``after`` are not schema-guaranteed either; JSON.stringify(undefined)
          yields the string "undefined", which would read like a real value. */
-      html.push('<div><span class="lbl">BEFORE</span>' +
+      html.push('<div><span class="lbl">' + t("before") + "</span>" +
                 ("before" in d ? colorize(compact(d.before)) : '<span class="dim">—</span>') + "</div>");
-      html.push('<div><span class="lbl">AFTER</span>' +
+      html.push('<div><span class="lbl">' + t("after") + "</span>" +
                 ("after" in d ? colorize(compact(d.after)) : '<span class="dim">—</span>') + "</div>");
       html.push("</div></div>");
     });
-    html.push("<h4>raw patches from this superstep</h4><pre class=\"blk\">" + colorize(pretty(vm.patches || {})) + "</pre>");
     host.innerHTML = html.join("");
   }
 
   function paneWrites(vm) {
     var host = document.querySelector('[data-pane="writes"]');
     var st = vm.steps[vm.currentSuperstep];
-    if (!st) { host.innerHTML = '<div class="empty">no superstep yet</div>'; return; }
-    var html = ['<h4>superstep ' + st.index + " · node writes, before the reducer</h4>"];
+    if (!st) { host.innerHTML = '<div class="empty">' + t("noSuperstep") + "</div>"; return; }
+    var html = ["<h4>superstep " + st.index + " · " + t("rawPatches") + "</h4>"];
     var any = false;
     st.nodes.forEach(function (n) {
       if (!(n in vm.writes)) return;
@@ -1018,7 +1121,7 @@
                 '<pre class="blk" style="border:0;border-radius:0;background:transparent">' +
                 colorize(pretty(vm.writes[n])) + "</pre></div>");
     });
-    if (!any) html.push('<div class="empty">no node has finished in this superstep yet</div>');
+    if (!any) html.push('<div class="empty">' + t("noNodeFinished") + "</div>");
     /* Tokens are per node, not per superstep, and the map is never cleared, so
        iterating all of it would print nodes from earlier supersteps under this
        superstep's heading. Only show the nodes that are running *now*. */
@@ -1031,7 +1134,7 @@
         var rest = vm.tokenDropped[n];
         html.push('<div class="kv"><div class="k">' + esc(n) + '</div><div class="v">' +
                   esc(vm.tokens[n].join("")) +
-                  (rest ? ' <span class="red">…(' + rest + " more chunks)</span>" : "") +
+                  (rest ? ' <span class="red">' + t("moreChunks")(rest) + "</span>" : "") +
                   "</div></div>");
       });
     }
@@ -1042,20 +1145,20 @@
     var d = ev.data || {};
     switch (ev.kind) {
       case "run_start":
-        return (d.graph && d.graph.name ? d.graph.name : "?") + " · entry " + (d.graph ? d.graph.entry : "?");
+        return (d.graph && d.graph.name ? d.graph.name : "?") + t("entry") + (d.graph ? d.graph.entry : "?");
       case "superstep_start": return "#" + d.index + " → " + (d.nodes || []).join(", ");
       case "node_start": return d.node;
       case "node_token": return d.node + ": " + JSON.stringify(d.token);
       case "node_end":
-        return d.node + " · " + fmtMs(d.duration_ms) + " · wrote " + (Object.keys(d.writes || {}).join(",") || "—");
-      case "state_merge": return "changed " + ((d.changed_channels || []).join(", ") || "—");
+        return d.node + " · " + fmtMs(d.duration_ms) + t("wrote") + (Object.keys(d.writes || {}).join(",") || "—");
+      case "state_merge": return t("changedColon") + ((d.changed_channels || []).join(", ") || "—");
       case "route_decision":
         return d.source + " → " + (Array.isArray(d.returned) ? d.returned.join("|") : d.returned) +
-               (d.condition ? " (" + d.condition + ")" : " (static)");
+               (d.condition ? " (" + d.condition + ")" : t("staticEdge"));
       case "checkpoint_created": return d.checkpoint_id + " · " + d.status;
-      case "interrupt": return d.node + " · waiting for a human";
+      case "interrupt": return d.node + t("waitingHuman");
       case "node_error": return d.node + ": " + d.error;
-      case "run_end": return d.status + " · " + d.supersteps + " supersteps";
+      case "run_end": return d.status + " · " + d.supersteps + t("supersteps");
       default: return "";
     }
   }
@@ -1083,7 +1186,7 @@
 
   function paintCps(vm) {
     var host = $("#cplist");
-    if (!vm.cpOrder.length) { host.innerHTML = '<div class="empty">no checkpoints yet</div>'; return; }
+    if (!vm.cpOrder.length) { host.innerHTML = '<div class="empty">' + t("noCpsYet") + "</div>"; return; }
     var html = [];
     vm.cpOrder.forEach(function (id) {
       var c = vm.cpById[id];
@@ -1105,14 +1208,14 @@
     var intr = "";
     if (vm.interrupts.length && vm.status === "interrupted") {
       var it = vm.interrupts[vm.interrupts.length - 1];
-      intr = '<div class="banner"><span class="ic">⏸</span><div><b>interrupted</b> at node <b>' + esc(it.node) +
+      intr = '<div class="banner"><span class="ic">⏸</span><div><b>' + t("interruptedAt") + "</b> " + t("atNode") + " <b>" + esc(it.node) +
              "</b> · checkpoint " + esc(it.checkpoint || "?") +
              '<pre class="blk" style="margin-top:6px">' + colorize(pretty(it.payload)) + "</pre></div></div>";
     }
     var errs = "";
     if (vm.errors.length && (vm.status === "error" || vm.status === "failed")) {
       var er = vm.errors[vm.errors.length - 1];
-      errs = '<div class="banner err"><span class="ic">✖</span><div>node <b>' + esc(er.node) + "</b> failed: " +
+      errs = '<div class="banner err"><span class="ic">✖</span><div>' + t("atNode") + " <b>" + esc(er.node) + "</b> " + t("nodeFailed") + " " +
              esc(er.error) + "</div></div>";
     }
     var banner = intr + errs;
@@ -1121,8 +1224,8 @@
     paneState(vm); paneDiff(vm); paneWrites(vm); paintCps(vm); paintEvents(vm, S.upto);
 
     $("#inspectorNote").textContent = vm.lastMerge
-      ? "reduced at seq " + vm.lastMerge.seq
-      : (vm.graph ? "waiting for a superstep" : "waiting for run_start…");
+      ? t("reducedAt")(vm.lastMerge.seq)
+      : (vm.graph ? t("waitingSuperstep") : t("graphWaiting"));
   }
 
   function paintCursor(vm) {
@@ -1133,8 +1236,8 @@
     var pct = total > 1 ? (S.upto / (total - 1)) * 100 : 0;
     range.style.setProperty("--pct", pct + "%");
     var seq = S.upto >= 0 && S.events[S.upto] ? S.events[S.upto].seq : -1;
-    $("#pos").innerHTML = "seq <b>" + seq + "</b> / " + (total ? S.events[total - 1].seq : "–") +
-      (S.wantTip ? ' <span style="color:var(--accent)">live</span>' : "");
+    $("#pos").innerHTML = t("seq") + " <b>" + seq + "</b> / " + (total ? S.events[total - 1].seq : "–") +
+      (S.wantTip ? ' <span style="color:var(--accent)">' + t("live") + "</span>" : "");
     $("#play").classList.toggle("on", S.playing);
     $("#play").textContent = S.playing ? "❚❚" : "▶";
     $("#live").classList.toggle("on", S.wantTip);
@@ -1208,7 +1311,7 @@
   function connect(after) {
     var url = "/events" + (after >= 0 ? "?after=" + after : "");
     if (!window.EventSource) {
-      setConn("err", "no EventSource");
+      setConn("err", t("noSource"));
       return;
     }
     var es = new EventSource(url);
@@ -1227,7 +1330,7 @@
     });
 
     es.addEventListener("done", function () {
-      setConn("0", "replay complete");
+      setConn("0", t("replayDone"));
       es.close();
     });
 
@@ -1240,7 +1343,7 @@
       } else if (es.readyState === 2) {
         setConn("err", "disconnected");
       } else {
-        setConn("1", "reconnecting…");
+        setConn("1", t("reconnecting"));
       }
     });
   }
@@ -1270,6 +1373,14 @@
     });
     $("#live").addEventListener("click", function () { S.playing = false; toTip(); });
     $("#play").addEventListener("click", function () { togglePlay(); });
+
+    $("#lang").addEventListener("click", function () {
+      var next = tLang() === "zh" ? "en" : "zh";
+      try { localStorage.setItem("lens-lang", next); } catch (e) {}
+      LANG = next;
+      applyStaticTexts();
+      paint();
+    });
 
     $("#steps").addEventListener("click", function (e) {
       var el = e.target.closest("[data-step]");
@@ -1311,6 +1422,28 @@
     paint();
   }
 
+  /* i18n: fill every static string, then keep the toggle's own label fresh. */
+  function applyStaticTexts() {
+    $("#lblGraph").textContent = t("graph");
+    $("#lblInspector").textContent = t("inspector");
+    $("#graphNote").textContent = t("graphWaiting");
+    $("#emptyState").textContent = t("noStateYetFull");
+    $("#emptyCps").textContent = t("noCpsYet");
+    $("#emptyMerge").textContent = t("noMergeYet");
+    $("#lblStep").textContent = t("step");
+    $("#lblPlay").textContent = t("play");
+    $("#lblTip").textContent = t("followTip");
+    $("#lblPure").textContent = t("pureNote");
+    $("#live").textContent = t("live");
+    document.querySelector('[data-tab="state"]').textContent = t("tabState");
+    document.querySelector('[data-tab="diff"]').textContent = t("tabDiff");
+    document.querySelector('[data-tab="writes"]').textContent = t("tabWrites");
+    document.querySelector('[data-tab="cps"]').textContent = t("tabCps");
+    var evTab = document.querySelector('[data-tab="events"]');
+    evTab.firstChild.nodeValue = t("tabEvents");
+    $("#lang").textContent = t("langLabel");
+  }
+
   /* ---- boot ----
      Always start from seq 0, deliberately. The page is a *pure function of the
      event prefix* (see derive()), so the graph, the superstep timeline and every
@@ -1320,6 +1453,7 @@
      incomplete. Resume across a *reconnect* is a different thing and is handled
      by the browser itself: EventSource resends ``Last-Event-ID``, so the server
      continues where the socket died without the page asking for it. */
+  applyStaticTexts();
   wire();
   paint();
   connect(-1);
