@@ -117,6 +117,132 @@ class TestCompile(unittest.TestCase):
         self.assertEqual(res2.state["log"], ["executed ? (decision=yes)"])
 
 
+class TestNewTemplates(unittest.TestCase):
+    """transform / map / subgraph — the declarative building blocks."""
+
+    def _run(self, spec, inputs):
+        from lens_harness.runtime import RunConfig, Runtime
+        from lens_harness.checkpoint import CheckpointStore
+        from lens_harness.events import ListSink
+
+        rt = Runtime(build_graph(spec).compile(),
+                     CheckpointStore(tempfile.mkdtemp()), ListSink())
+        return rt.invoke(inputs, RunConfig(thread_id="t"))
+
+    def _run_expect_failure(self, spec, inputs):
+        """Run and yield the error text; node-level SpecErrors surface as
+        failed runs (kernel records node_error) — that IS the loud failure."""
+        from lens_harness.runtime import RunConfig, Runtime
+        from lens_harness.checkpoint import CheckpointStore
+        from lens_harness.events import ListSink
+
+        class _Expect:
+            def __enter__(self):
+                res = Runtime(build_graph(spec).compile(),
+                              CheckpointStore(tempfile.mkdtemp()),
+                              ListSink()).invoke(inputs, RunConfig(thread_id="t"))
+                assert res.status == "failed", f"expected failed, got {res.status}"
+                return str(res.error)
+
+            def __exit__(self, *a):
+                return False
+
+        return _Expect()
+
+    def test_transform_substitutes_channels(self):
+        spec = base_spec(
+            state={"x": "str", "report": "str"},
+            nodes={"a": {"type": "python", "fn": "examples.approval_actions:echo_x"},
+                   "rep": {"type": "transform", "set": {"report": "got: {x}!"}}},
+            edges={"a": "rep", "rep": "__end__"},
+        )
+        res = self._run(spec, {"x": "hi", "report": ""})
+        self.assertEqual(res.state["report"], "got: echo:hi!")
+
+    def test_transform_unknown_channel_ref_fails_the_node(self):
+        # A bad {ref} inside a node cannot be a compile-time error (it depends
+        # on runtime state), so the kernel records it as a node_error — the
+        # message must still name the offending placeholder.
+        spec = base_spec(
+            state={"x": "str"},
+            nodes={"a": {"type": "transform", "set": {"x": "{ghost}"}}},
+        )
+        rt = build_graph(spec).compile()
+        from lens_harness.runtime import RunConfig, Runtime
+        from lens_harness.checkpoint import CheckpointStore
+        from lens_harness.events import ListSink
+        res = Runtime(rt, CheckpointStore(tempfile.mkdtemp()), ListSink()).invoke(
+            {"x": ""}, RunConfig(thread_id="t"))
+        self.assertEqual(res.status, "failed")
+        self.assertIn("ghost", str(res.error))
+
+    def test_map_applies_fn_to_every_item(self):
+        spec = base_spec(
+            state={"x": "str", "items": ["list[str]", "overwrite"],
+                   "results": ["list[str]", "overwrite"]},
+            nodes={"a": {"type": "map", "fn": "examples.approval_actions:upper_item",
+                         "over": "items", "into": "results"}},
+        )
+        res = self._run(spec, {"x": "", "items": ["a", "b"],
+                               "results": []})
+        self.assertEqual(res.state["results"], ["A", "B"])
+
+    def test_map_rejects_non_list_channel(self):
+        spec = base_spec(
+            state={"x": "str", "items": "str", "results": "list[str]"},
+            nodes={"a": {"type": "map", "fn": "examples.approval_actions:upper_item",
+                         "over": "items", "into": "results"}},
+        )
+        with self._run_expect_failure(spec, {"x": "", "items": 42, "results": []}) as err:
+            self.assertIn("must be a list", err)
+
+    def test_subgraph_runs_child_and_maps_outputs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            child = os.path.join(tmp, "child.json")
+            with open(child, "w") as fh:
+                json.dump({
+                    "name": "child",
+                    "state": {"q": "str", "marker": "str"},
+                    "nodes": {"c": {"type": "python",
+                                    "fn": "examples.approval_actions:child_state"}},
+                    "entry": "c", "edges": {"c": "__end__"},
+                }, fh)
+            parent = {
+                "name": "parent",
+                "state": {"x": "str", "marker": "str", "sub_run": "str"},
+                "nodes": {"sub": {"type": "subgraph", "spec": "child.json",
+                                  "inputs": {"x": "q"},
+                                  "outputs": {"marker": "marker"},
+                                  "run_into": "sub_run"}},
+                "entry": "sub",
+                "edges": {"sub": "__end__"},
+            }
+            graph = build_graph(parent, spec_dir=tmp).compile()
+            from lens_harness.runtime import RunConfig, Runtime
+            from lens_harness.checkpoint import CheckpointStore
+            from lens_harness.events import ListSink
+
+            rt = Runtime(graph, CheckpointStore(tempfile.mkdtemp()), ListSink())
+            res = rt.invoke({"x": "hello", "marker": "", "sub_run": ""},
+                            RunConfig(thread_id="t"))
+            self.assertEqual(res.status, "complete")
+            self.assertEqual(res.state["marker"], "child saw hello")
+            self.assertTrue(res.state["sub_run"].startswith("r_"))
+
+    def test_subgraph_mapping_channels_must_be_declared(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            child = os.path.join(tmp, "child.json")
+            with open(child, "w") as fh:
+                json.dump(base_spec(), fh)
+            spec = base_spec(
+                nodes={"a": {"type": "subgraph", "spec": "child.json",
+                             "inputs": {"nope": "x"}}},
+            )
+            with self.assertRaises(SpecError) as cm:
+                build_graph(spec, spec_dir=tmp)
+            self.assertIn("inputs.nope", str(cm.exception))
+
+
 class TestSpecErrors(unittest.TestCase):
     def assertSpecError(self, spec, fragment):
         with self.assertRaises(SpecError) as cm:

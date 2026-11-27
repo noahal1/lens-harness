@@ -287,7 +287,7 @@ lens-harness/
 │   ├── test_flows.py      # 8 项，interrupt/resume + LLM
 │   ├── test_serve.py      # 31 项，SSE 传输 + 页面纯度
 │   └── test_compare.py    # 8 项，M3 trace 对比契约
-│   └── test_dsl.py        # 14 项，JSON 编排 DSL 契约
+│   └── test_dsl.py        # 20 项，JSON 编排 DSL 契约
 ├── traces/                # 运行时产物
 │   ├── r_XXXXXXXX.jsonl   # 一份 trace（run_id = "r_" + uuid4 hex[:8]）
 │   └── checkpoints/       # <thread_id>_<superstep:04d>_<hex6>.json
@@ -769,7 +769,7 @@ spec 结构（完整示例见 `examples/calc-agent.json`、`examples/approval-fl
 | 字段 | 说明 |
 |---|---|
 | `state` | 通道声明：`"名字": "类型"` 或 `["类型", "reducer"]`，reducer ∈ `add / add_unique / merge_dict / overwrite` |
-| `nodes` | 四种节点：`llm`（一轮模型调用，`system` 提示词 + `max_steps` 步数上限）、`tool_loop`（执行上一条助手消息里的 `TOOL: name \| arg`）、`interrupt`（人工审批点，`resume_into` 指定恢复后进入的节点）、`python`（`fn: "module:func"`） |
+| `nodes` | 七种节点：`llm`（一轮模型调用，`system` 提示词 + `max_steps` 步数上限）、`tool_loop`（执行上一条助手消息里的 `TOOL: name \| arg`）、`interrupt`（人工审批点，`resume_into` 指定恢复后进入的节点）、`python`（`fn: "module:func"`）、`transform`（声明式改写：`"set": {"通道": "模板，{通道} 会被替换"}`）、`map`（对 `over` 列表通道逐项调用 `fn`，结果进 `into`）、`subgraph`（嵌套另一个 spec：`spec` 相对路径 + `inputs`/`outputs` 通道映射，可选 `run_into` 记录子 run_id） |
 | `tools` | 工具注册表：`builtin:calculator`、`builtin:word_count` 或 `python:module:func` |
 | `edges` | `"节点": "目标"` 静态边，或 `{"condition": "tool_call" 或 "python:mod:fn", "then": {key: 目标}}` 条件边；`"__end__"` 结束 |
 | `entry` | 入口节点 |

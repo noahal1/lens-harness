@@ -771,9 +771,9 @@ self.emitter.emit(
 
 这条**曾隐含「编排只能写 Python」**。JSON DSL（`dsl.py` + `run --graph`）落地后重新划界：
 
-- **做了**：一个**声明式编排入口**——JSON spec 编译成普通的 `StateGraph`，节点模板固定四种（`llm` / `tool_loop` / `interrupt` / `python`），路由条件是内置两种（`tool_call` / `always`）或 `python:module:func` 引用。编译后的图与手写的图**不可区分**：同一内核、同一事件契约、同一 trace/diff 路径。spec 错误一律 `SpecError` 带 JSON 路径，不静默降级。
+- **做了**：一个**声明式编排入口**——JSON spec 编译成普通的 `StateGraph`，节点模板七种（`llm` / `tool_loop` / `interrupt` / `python`，加上声明式的 `transform` / `map` / `subgraph`），路由条件是内置两种（`tool_call` / `always`）或 `python:module:func` 引用。编译后的图与手写的图**不可区分**：同一内核、同一事件契约、同一 trace/diff 路径。spec 错误一律 `SpecError` 带 JSON 路径，不静默降级；节点运行期的 spec 违规（如 transform 引用不存在的通道、map 收到非列表）走内核的 `node_error` → run `failed`，同样响亮。`subgraph` 的子图有自己的 run/trace/checkpoint，父图通过 `run_into` 记录子 run_id——不合并两条 trace，只留关联键。
 - **仍然不做**：可视化拖拽编排器（浏览器仍是只读 lens，见上）。
-- **仍然不做**：插件/注册表式的节点类型扩展——四种写死了；加新类型要改 `dsl.py`，这属于内核演进而非编排行为。
+- **仍然不做**：插件/注册表式的节点类型扩展——七种写死了；加新类型要改 `dsl.py`，这属于内核演进而非编排行为。
 - **仍然不做**：YAML 或其它格式——保持零依赖（原则一）。JSON 够表达图结构；`pyyaml` 的依赖代价买不来新能力。
 - **仍然不做**：在 spec 里内嵌任意代码——`python` 节点与条件必须是可导入的 `module:func` 引用，代码在仓库里、可 review、可测。内嵌代码字符串会让「编排文件」变成「藏起来的程序」，trace 也无法对它负责。
 

@@ -1,0 +1,12 @@
+{
+  "name": "child",
+  "state": {
+    "q": "str",
+    "marker": "str"
+  },
+  "nodes": {
+    "c": {"type": "python", "fn": "examples.approval_actions:child_state"}
+  },
+  "entry": "c",
+  "edges": {"c": "__end__"}
+}

@@ -13,3 +13,13 @@ def do_apply(state, ctx) -> dict:
 def echo_x(state, ctx) -> dict:
     """Minimal test node: writes only the declared channel ``x``."""
     return {"x": f"echo:{state.get('x', '')}"}
+
+
+def upper_item(item) -> object:
+    """map-node helper: uppercase a string item."""
+    return str(item).upper()
+
+
+def child_state(state, ctx) -> dict:
+    """For the child spec: pass-through marker that the child really ran."""
+    return {"marker": f"child saw {state.get('q', '')}"}

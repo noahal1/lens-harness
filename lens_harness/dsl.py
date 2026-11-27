@@ -36,7 +36,14 @@ Spec format
         "gate": {"type": "interrupt",
                  "question": "Approve?",
                  "resume_into": "apply"},
-        "apply": {"type": "python", "fn": "my_module:do_apply"}
+        "apply": {"type": "python", "fn": "my_module:do_apply"},
+        "summarize": {"type": "transform",
+                      "set": {"report": "Q: {question} A: {answer}"}},
+        "double": {"type": "map", "fn": "my_module:double",
+                   "over": "items", "into": "results"},
+        "inner": {"type": "subgraph", "spec": "child.json",
+                  "inputs": {"question": "q"},
+                  "outputs": {"answer": "a"}}
       },
       "entry": "agent",
       "edges": {
@@ -59,6 +66,16 @@ Node types:
   ``resume_into`` names the node to re-enter on resume.
 * ``python`` — calls ``module:func``; the function must have the ordinary
   node signature ``(state, ctx) -> patch``.
+* ``transform`` — pure-declarative state rewrite: ``"set": {channel:
+  "template with {channel} refs"}``; every ``{name}`` must be a declared
+  channel with a value.
+* ``map`` — fan-out: ``fn: "module:func"`` with signature ``(item) -> item``
+  applied to each element of channel ``over``, results collected into
+  ``into`` (via that channel's reducer).
+* ``subgraph`` — a nested spec file runs as one node: ``spec`` (path, relative
+  to the parent), ``inputs``/``outputs`` channel mappings. The child gets its
+  own run/trace/checkpoints; the parent writes the child's run_id into
+  ``_subgraph_run`` so the traces stay joinable.
 
 Edge forms:
 
@@ -75,6 +92,7 @@ from __future__ import annotations
 
 import importlib
 import json
+import os
 import re
 from typing import Any, Callable
 
@@ -312,6 +330,102 @@ def make_python_node(fn: Callable) -> Callable:
 
 
 # --------------------------------------------------------------------------
+# Declarative templates: transform / map / subgraph
+# --------------------------------------------------------------------------
+_TEMPLATE_RE = re.compile(r"\{([a-zA-Z_]\w*)\}")
+
+
+def make_transform_node(path: str, writes: dict[str, str]) -> Callable:
+    """Declarative state rewrite: ``"set": {"out": "Q: {question}"}``.
+
+    Each value is a template whose ``{channel}`` placeholders are substituted
+    from the current state. The written channel must be declared (the kernel
+    rejects unknown channels anyway) — this node is for the common "combine a
+    few channels into a string/dict" step that would otherwise be a trivial
+    python function.
+    """
+
+    def transform_node(state: dict[str, Any], ctx: Any) -> dict[str, Any]:
+        patch: dict[str, Any] = {}
+        for channel, template in writes.items():
+            def sub(m: "re.Match[str]") -> str:
+                name = m.group(1)
+                if name not in state:
+                    raise SpecError(
+                        f"{path}: template for {channel!r} references "
+                        f"{{{name}}}, which is not a declared channel")
+                return str(state[name])
+            patch[channel] = _TEMPLATE_RE.sub(sub, str(template))
+        return patch
+
+    transform_node.__name__ = "transform_node"
+    return transform_node
+
+
+def make_map_node(path: str, fn: Callable, *, over: str, into: str) -> Callable:
+    """Fan-out: call ``fn`` on each item of channel ``over``, collect into ``into``.
+
+    ``fn`` must have the signature ``(item: Any) -> Any``. The results append
+    via the target channel's reducer — declare it ``add`` to accumulate across
+    supersteps, or a plain type to overwrite with this node's whole result.
+    """
+
+    def map_node(state: dict[str, Any], ctx: Any) -> dict[str, Any]:
+        items = state.get(over)
+        if items is None:
+            raise SpecError(f"{path}: channel {over!r} has no value yet")
+        if not isinstance(items, list):
+            raise SpecError(f"{path}: channel {over!r} must be a list, "
+                            f"got {type(items).__name__}")
+        return {into: [fn(item) for item in items]}
+
+    map_node.__name__ = "map_node"
+    return map_node
+
+
+def make_subgraph_node(path: str, sub_graph: Any, *, inputs: dict[str, str],
+                       outputs: dict[str, str],
+                       record_run_channel: str | None = None) -> Callable:
+    """Run a nested spec's compiled graph as one node.
+
+    ``inputs`` maps *this graph's* channels to the child's input channels;
+    ``outputs`` maps child final-state channels back into ours. The child runs
+    its own full Runtime with its own trace/checkpoints — the parent trace
+    records the child's run_id, so the two traces stay joinable. LLM spec and
+    thread inheritance: the child gets a ``<parent-thread>/<node>`` thread id.
+    """
+
+    def subgraph_node(state: dict[str, Any], ctx: Any) -> dict[str, Any]:
+        from .checkpoint import CheckpointStore
+        from .events import ListSink
+        from .runtime import RunConfig, Runtime
+
+        child_in = {child: state[mine] for mine, child in inputs.items()}
+        sink = ListSink()
+        store = CheckpointStore(_SUB_TRACE_DIR)
+        child_rt = Runtime(sub_graph, store, sink)
+        child_cfg = RunConfig(thread_id=f"{ctx.thread_id}/{ctx.node}")
+        result = child_rt.invoke(child_in, child_cfg)
+        if result.status != "complete":
+            raise SpecError(
+                f"{path}: subgraph run {result.run_id} ended '{result.status}'"
+                + (f" ({result.error})" if result.error else ""))
+        patch = {mine: result.state[child]
+                 for mine, child in outputs.items() if child in result.state}
+        if record_run_channel:
+            patch[record_run_channel] = result.run_id
+        return patch
+
+    subgraph_node.__name__ = "subgraph_node"
+    return subgraph_node
+
+
+#: Where sub-graph traces go; build_graph() sets it so the CLI's --trace-dir
+#: is honored without threading it through every node signature.
+_SUB_TRACE_DIR = "traces"
+
+
+# --------------------------------------------------------------------------
 # Router conditions
 # --------------------------------------------------------------------------
 def cond_tool_call(state: dict[str, Any]) -> str:
@@ -355,10 +469,16 @@ def _build_condition(source: str, cond: str,
 # --------------------------------------------------------------------------
 # Compile
 # --------------------------------------------------------------------------
-def build_graph(spec: dict[str, Any], *, llm_spec: str | None = None) -> StateGraph:
-    """Compile a spec dict into a ``StateGraph`` — ordinary kernel path after."""
+def build_graph(spec: dict[str, Any], *, llm_spec: str | None = None,
+                spec_dir: str | None = None) -> StateGraph:
+    """Compile a spec dict into a ``StateGraph`` — ordinary kernel path after.
+
+    ``spec_dir`` resolves subgraph spec paths (relative to the parent spec's
+    directory); ``run_spec`` sets it automatically.
+    """
     if not isinstance(spec, dict):
         raise SpecError("spec must be a JSON object")
+    spec_dir = spec_dir or "."
     name = spec.get("name") or "spec-graph"
 
     schema = _build_schema(spec)
@@ -414,9 +534,54 @@ def build_graph(spec: dict[str, Any], *, llm_spec: str | None = None) -> StateGr
                 raise _err(f"{path}.fn", "python node needs fn: 'module:func'")
             graph.add_node(node_name, make_python_node(
                 _resolve_ref(str(ref), f"{path}.fn")))
+        elif ntype == "transform":
+            writes = cfg.get("set")
+            if not isinstance(writes, dict) or not writes:
+                raise _err(f"{path}.set",
+                           'transform needs {"set": {"channel": "template with {refs}"}}')
+            for ch in writes:
+                if ch not in spec.get("state", {}):
+                    raise _err(f"{path}.set.{ch}",
+                               f"channel {ch!r} is not declared in state")
+            graph.add_node(node_name, make_transform_node(path, dict(writes)))
+        elif ntype == "map":
+            ref = cfg.get("fn")
+            over, into = cfg.get("over"), cfg.get("into")
+            if not ref:
+                raise _err(f"{path}.fn", "map needs fn: 'module:func(item) -> item'")
+            if not over or not into:
+                raise _err(f"{path}.over/.into", "map needs over (list channel) and into (result channel)")
+            if over not in spec.get("state", {}) or into not in spec.get("state", {}):
+                raise _err(path, "over and into must be declared channels")
+            graph.add_node(node_name, make_map_node(
+                path, _resolve_ref(str(ref), f"{path}.fn"),
+                over=str(over), into=str(into)))
+        elif ntype == "subgraph":
+            ref = cfg.get("spec")
+            if not ref:
+                raise _err(f"{path}.spec", "subgraph needs spec: path to a JSON spec")
+            sub_spec_path = os.path.join(spec_dir, str(ref)) if not os.path.isabs(str(ref)) else str(ref)
+            sub_spec = load_spec(sub_spec_path)
+            inputs, outputs = cfg.get("inputs") or {}, cfg.get("outputs") or {}
+            for mine, child in inputs.items():
+                if mine not in spec.get("state", {}) or child not in sub_spec.get("state", {}):
+                    raise _err(f"{path}.inputs.{mine}",
+                               "both sides of an input mapping must be declared channels")
+            for mine, child in outputs.items():
+                if mine not in spec.get("state", {}) or child not in sub_spec.get("state", {}):
+                    raise _err(f"{path}.outputs.{mine}",
+                               "both sides of an output mapping must be declared channels")
+            if cfg.get("run_into") and cfg["run_into"] not in spec.get("state", {}):
+                raise _err(f"{path}.run_into",
+                           f"channel {cfg['run_into']!r} is not declared in state")
+            sub_graph = build_graph(sub_spec, llm_spec=llm_spec, spec_dir=os.path.dirname(sub_spec_path))
+            graph.add_node(node_name, make_subgraph_node(
+                path, sub_graph.compile(), inputs=dict(inputs), outputs=dict(outputs),
+                record_run_channel=str(cfg["run_into"]) if cfg.get("run_into") else None))
         else:
             raise _err(f"{path}.type",
-                       f"unknown node type {ntype!r}; have llm | tool_loop | interrupt | python")
+                       "unknown node type "
+                       f"{ntype!r}; have llm | tool_loop | interrupt | python | transform | map | subgraph")
 
     # -- edges ---------------------------------------------------------------
     edges = spec.get("edges")
@@ -467,12 +632,15 @@ def run_spec(path: str, inputs: dict[str, Any], *, trace_dir: str = "traces",
     """Load a spec, run it once, write the trace — the CLI entry point."""
     import os
 
+    from . import dsl as _dsl
     from .checkpoint import CheckpointStore
     from .events import ListSink
     from .runtime import RunConfig, Runtime
 
     spec = load_spec(path)
-    graph = build_graph(spec, llm_spec=llm_spec)
+    path = os.path.abspath(path)
+    _dsl._SUB_TRACE_DIR = trace_dir  # sub-graph traces land beside the parent's
+    graph = build_graph(spec, llm_spec=llm_spec, spec_dir=os.path.dirname(path))
     sink = ListSink()
     store = CheckpointStore(os.path.join(trace_dir, "checkpoints"))
     runtime = Runtime(graph.compile(), store, sink)

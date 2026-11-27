@@ -1,0 +1,26 @@
+{
+  "name": "pipeline",
+  "state": {
+    "items": ["list[str]", "overwrite"],
+    "shouted": ["list[str]", "overwrite"],
+    "report": "str",
+    "inner_marker": "str",
+    "sub_run": "str"
+  },
+  "nodes": {
+    "shout": {"type": "map", "fn": "examples.approval_actions:upper_item",
+              "over": "items", "into": "shouted"},
+    "summarize": {"type": "transform",
+                  "set": {"report": "processed {items} -> {shouted}"}},
+    "call_child": {"type": "subgraph", "spec": "child.json",
+                   "inputs": {"report": "q"},
+                   "outputs": {"inner_marker": "marker"},
+                   "run_into": "sub_run"}
+  },
+  "entry": "shout",
+  "edges": {
+    "shout": "summarize",
+    "summarize": "call_child",
+    "call_child": "__end__"
+  }
+}
