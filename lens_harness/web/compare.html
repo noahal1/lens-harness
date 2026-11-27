@@ -2,30 +2,54 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <title>lens · trace diff</title>
 <style>
+  /* Same design language as index.html: one palette, one radius scale,
+     mono-first. Pure consumer of /api/diff — only the paint changed. */
   :root {
-    --bg: #12151c; --panel: #1a1f2a; --line: #2a3140;
-    --fg: #d6dbe4; --dim: #6d7686;
-    --same: #3a4152; --changed: #e5a54b; --onlya: #d16a6a; --onlyb: #6aa7d1;
-    --green: #7dc47f; --mono: ui-monospace, "Cascadia Mono", Consolas, monospace;
+    --bg: #0b0e13; --panel: #11151c; --panel-2: #151b24; --line: #1f2833; --line-2: #2b3644;
+    --fg: #dbe3ec; --dim: #6b7889;
+    --same: #3a4152; --changed: #e0a83c; --onlya: #e8695f; --onlyb: #6aa8e0;
+    --accent: #57c7b0; --green: #7dc47f;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
   }
   * { box-sizing: border-box; }
   body {
     margin: 0; background: var(--bg); color: var(--fg);
     font-family: var(--mono); font-size: 13px; line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
   }
+  :focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; border-radius: 4px; }
+  @media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
+
   header {
     padding: 10px 16px; border-bottom: 1px solid var(--line);
     display: flex; gap: 18px; align-items: baseline; flex-wrap: wrap;
+    background: linear-gradient(180deg, #12171f, #0e131a);
+    box-shadow: 0 1px 8px rgba(0,0,0,.25);
+    position: relative; z-index: 2;
   }
-  header h1 { font-size: 14px; margin: 0; }
+  header h1 {
+    font-size: 14px; margin: 0; color: var(--accent); letter-spacing: .08em; font-weight: 600;
+  }
+  header h1::before {
+    content: ""; display: inline-block; width: 9px; height: 9px; margin-right: 9px;
+    border-radius: 50%; vertical-align: 1px;
+    background: radial-gradient(circle at 35% 30%, #9ff0df, var(--accent) 55%, #1d5a50);
+    box-shadow: 0 0 10px rgba(87,199,176,.55);
+  }
   header .meta { color: var(--dim); }
   #counts { display: flex; gap: 14px; margin-left: auto; }
-  #counts span b { font-size: 15px; }
-  main { padding: 12px 16px 40px; }
+  #counts span b { font-size: 15px; font-variant-numeric: tabular-nums; }
+  #counts .chip {
+    padding: 3px 10px; border: 1px solid var(--line-2); border-radius: 999px;
+    background: var(--panel); font-size: 11px;
+  }
+  main { padding: 14px 16px 40px; max-width: 1100px; }
   .identical {
-    color: var(--green); padding: 24px 0; font-size: 15px;
+    color: var(--green); padding: 28px 16px; font-size: 15px;
+    border: 1px solid #2f4a44; border-radius: 10px; background: rgba(87,199,176,.05);
   }
   section { margin: 0 0 26px; }
   section h2 {
@@ -33,20 +57,34 @@
     color: var(--dim); border-bottom: 1px solid var(--line);
     padding-bottom: 6px; margin: 0 0 10px;
   }
-  .entry { padding: 6px 10px; border-left: 3px solid var(--same); margin: 0 0 10px; background: var(--panel); }
+  .entry {
+    padding: 8px 12px; border-left: 3px solid var(--same); margin: 0 0 10px;
+    background: var(--panel); border-radius: 4px 8px 8px 4px;
+    transition: border-color .12s, background .12s;
+  }
+  .entry:hover { background: var(--panel-2); }
   .entry.changed  { border-left-color: var(--changed); }
   .entry.only_a   { border-left-color: var(--onlya); }
   .entry.only_b   { border-left-color: var(--onlyb); }
-  .entry .head { display: flex; gap: 10px; }
+  .entry .head { display: flex; gap: 10px; align-items: baseline; }
   .entry .kind { color: var(--changed); font-weight: bold; }
-  .entry.only_a .kind, .entry.only_b .kind { color: var(--fg); }
+  .entry.only_a .kind { color: var(--onlya); }
+  .entry.only_b .kind { color: var(--onlyb); }
   .entry .key { color: var(--dim); }
-  .entry .fields { color: var(--dim); margin-left: auto; }
+  .entry .fields { color: var(--dim); margin-left: auto; font-size: 11px; }
   .pair { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 6px; }
-  .pair .side { background: #10131a; padding: 6px 8px; white-space: pre-wrap; word-break: break-all; }
-  .pair .tag { color: var(--dim); font-size: 11px; margin-bottom: 2px; }
-  .single { background: #10131a; padding: 6px 8px; margin-top: 6px; white-space: pre-wrap; word-break: break-all; }
-  .error { color: var(--onlya); padding: 20px 0; }
+  .pair .side {
+    background: #0d1218; border: 1px solid var(--line); padding: 7px 9px;
+    white-space: pre-wrap; word-break: break-all; border-radius: 6px; min-width: 0;
+  }
+  .pair .side:first-child { color: #c9a3a0; }
+  .pair .side:last-child  { color: #a2bda9; }
+  .pair .tag { color: var(--dim); font-size: 11px; margin-bottom: 2px; letter-spacing: .1em; text-transform: uppercase; }
+  .single {
+    background: #0d1218; border: 1px solid var(--line); padding: 7px 9px; margin-top: 6px;
+    white-space: pre-wrap; word-break: break-all; border-radius: 6px; color: var(--dim);
+  }
+  .error { color: var(--onlya); padding: 24px 4px; }
 </style>
 </head>
 <body>
@@ -54,10 +92,10 @@
   <h1>lens · trace diff</h1>
   <span class="meta" id="meta">loading…</span>
   <div id="counts">
-    <span class="meta">same <b id="c-same">–</b></span>
-    <span style="color:var(--changed)">changed <b id="c-changed">–</b></span>
-    <span style="color:var(--onlya)">only-a <b id="c-onlya">–</b></span>
-    <span style="color:var(--onlyb)">only-b <b id="c-onlyb">–</b></span>
+    <span class="chip">same <b id="c-same">–</b></span>
+    <span class="chip" style="color:var(--changed)">changed <b id="c-changed">–</b></span>
+    <span class="chip" style="color:var(--onlya)">only-a <b id="c-onlya">–</b></span>
+    <span class="chip" style="color:var(--onlyb)">only-b <b id="c-onlyb">–</b></span>
   </div>
 </header>
 <main id="main"><div class="meta">…</div></main>
