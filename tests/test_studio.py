@@ -79,6 +79,26 @@ class StudioTestCase(unittest.TestCase):
         out = self.run_cmd(cmd="get_spec")
         self.assertIn("```json", out["messages"][0]["text"])
 
+    def test_langgraph_style_templates_complete(self):
+        """supervisor / reflection / plan_execute / debate run to completion."""
+        for name, probe in (("supervisor", "result"),
+                            ("reflection", "verdict"),
+                            ("plan_execute", "results"),
+                            ("debate", "log")):
+            out = self.run_cmd(cmd="init", template=name)
+            self.assertTrue(out["ok"], name)
+            out = self.run_cmd(cmd="run", input=self.s.default_input)
+            self.assertTrue(out["ok"], name)
+            record = out["runs"][-1]
+            self.assertEqual(record["status"], "complete", name)
+            self.assertIn(probe, record["state"], name)
+
+    def test_init_strips_studio_metadata(self):
+        self.run_cmd(cmd="init", template="supervisor")
+        self.assertNotIn("desc", self.s.spec)
+        self.assertNotIn("desc_en", self.s.spec)
+        self.assertNotIn("input", self.s.spec)
+
 
 if __name__ == "__main__":
     import os as _os

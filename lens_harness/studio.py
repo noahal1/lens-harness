@@ -80,6 +80,87 @@ _TEMPLATES: dict[str, dict[str, Any]] = {
         "entry": "gate",
         "edges": {"gate": "apply", "apply": "__end__"},
     },
+    "supervisor": {
+        "desc": "主管模式（LangGraph 经典）：主管把任务队列逐个分派给工人节点执行，全部做完才收工",
+        "desc_en": "Supervisor (LangGraph classic): a supervisor hands tasks from a queue to a worker node one by one, and ends when the queue is empty.",
+        "input": {"tasks": ["collect data", "clean data", "write report"]},
+        "name": "studio-supervisor",
+        "state": {"tasks": ["list[str]", "overwrite"], "current": "str",
+                  "result": "str", "rounds": "int",
+                  "log": ["list[str]", "add"]},
+        "nodes": {
+            "dispatch": {"type": "python",
+                         "fn": "examples.studio_routers:pop_task"},
+            "work": {"type": "python",
+                     "fn": "examples.studio_routers:do_work"},
+        },
+        "entry": "dispatch",
+        "edges": {
+            "dispatch": {"condition": "python:examples.studio_routers:supervisor_route",
+                         "then": {"work": "work", "end": "__end__"}},
+            "work": "dispatch",
+        },
+    },
+    "reflection": {
+        "desc": "反思循环（LangGraph 经典）：先写初稿，评审员打回就修改重写，通过（或到上限）才结束",
+        "desc_en": "Reflection (LangGraph classic): draft first; if the critic rejects, revise and try again until it passes or hits the cap.",
+        "input": {},
+        "name": "studio-reflection",
+        "state": {"draft": "str", "verdict": "str", "notes": "str",
+                  "rounds": "int"},
+        "nodes": {
+            "write": {"type": "python",
+                      "fn": "examples.studio_routers:draft_v1"},
+            "critic": {"type": "python",
+                       "fn": "examples.studio_routers:critique"},
+            "rewrite": {"type": "python",
+                        "fn": "examples.studio_routers:revise"},
+        },
+        "entry": "write",
+        "edges": {
+            "write": "critic",
+            "critic": {"condition": "python:examples.studio_routers:reflection_route",
+                       "then": {"retry": "rewrite", "done": "__end__"}},
+            "rewrite": "critic",
+        },
+    },
+    "plan_execute": {
+        "desc": "先规划再执行（LangGraph 经典）：把目标拆成步骤清单，然后逐步执行到清单清空",
+        "desc_en": "Plan-and-execute (LangGraph classic): split the goal into a step list, then execute steps until the plan is empty.",
+        "input": {"goal": "search sources 然后 extract facts 然后 write summary"},
+        "name": "studio-plan",
+        "state": {"goal": "str", "plan": ["list[str]", "overwrite"],
+                  "results": ["list[str]", "add"], "rounds": "int"},
+        "nodes": {
+            "planner": {"type": "python",
+                        "fn": "examples.studio_routers:make_plan"},
+            "step": {"type": "python",
+                     "fn": "examples.studio_routers:next_step"},
+        },
+        "entry": "planner",
+        "edges": {
+            "planner": "step",
+            "step": {"condition": "python:examples.studio_routers:plan_route",
+                     "then": {"execute": "step", "finish": "__end__"}},
+        },
+    },
+    "debate": {
+        "desc": "两个 agent 辩论（多 agent 交互）：A 发言、B 反驳，交替几轮后结束",
+        "desc_en": "Two-agent debate: A argues, B rebuts, alternating for a few rounds before ending.",
+        "input": {},
+        "name": "studio-debate",
+        "state": {"rounds": "int", "log": ["list[str]", "add"]},
+        "nodes": {
+            "a": {"type": "python", "fn": "examples.studio_routers:debate_a"},
+            "b": {"type": "python", "fn": "examples.studio_routers:debate_b"},
+        },
+        "entry": "a",
+        "edges": {
+            "a": "b",
+            "b": {"condition": "python:examples.studio_routers:handback_route",
+                  "then": {"reply": "a", "end": "__end__"}},
+        },
+    },
 }
 
 
@@ -140,6 +221,7 @@ class StudioSession:
         # desc / input are studio metadata, not spec fields — keep them out of
         # the JSON the user exports, or build_graph would reject the unknown keys.
         desc, default_input = spec.pop("desc", ""), spec.pop("input", {})
+        spec.pop("desc_en", None)  # bilingual description is studio metadata too
         self.default_input = default_input
         self.spec = spec
         self.runs = []
