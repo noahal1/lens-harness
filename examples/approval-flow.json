@@ -1,0 +1,17 @@
+{
+  "name": "approval-flow",
+  "state": {
+    "action": "str",
+    "decision": "str",
+    "log": ["list[str]", "add"]
+  },
+  "nodes": {
+    "request": {"type": "interrupt", "question": "Approve this action?", "resume_into": "apply"},
+    "apply": {"type": "python", "fn": "examples.approval_actions:do_apply"}
+  },
+  "entry": "request",
+  "edges": {
+    "request": "apply",
+    "apply": "__end__"
+  }
+}

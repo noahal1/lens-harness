@@ -169,6 +169,7 @@ checkpoint DAG
 | `serve <trace> [--host H] [--port P] [--follow]` | 在浏览器里看同一份 trace |
 | `serve <trace-a> <trace-b>` | 浏览器版对比页（`/compare`） |
 | `run <mod:attr> [--input JSON] [--trace-dir DIR] [--llm SPEC]` | 跑示例，写 trace 并渲染 |
+| `run --graph spec.json [--input JSON]` | 跑一个 JSON 编排的 agent（见「用 JSON 编排 agent」） |
 
 下面的命令块里 `<trace>` 都换成你自己的那份 jsonl 路径（本文样例用 `traces/r_c22281d6.jsonl`）。
 
@@ -286,6 +287,7 @@ lens-harness/
 │   ├── test_flows.py      # 8 项，interrupt/resume + LLM
 │   ├── test_serve.py      # 31 项，SSE 传输 + 页面纯度
 │   └── test_compare.py    # 8 项，M3 trace 对比契约
+│   └── test_dsl.py        # 14 项，JSON 编排 DSL 契约
 ├── traces/                # 运行时产物
 │   ├── r_XXXXXXXX.jsonl   # 一份 trace（run_id = "r_" + uuid4 hex[:8]）
 │   └── checkpoints/       # <thread_id>_<superstep:04d>_<hex6>.json
@@ -750,6 +752,35 @@ $ py -3.13 -m lens_harness run examples.agent:build --llm mock --input '{"questi
 两个都是「对」的，只是跑的是不同脚本。想看完整的 5 步故事，**不要传 `--llm`**。
 
 ---
+
+## 用 JSON 编排 agent（DSL）
+
+不写 Python 也能编排一个 agent：一个 JSON 文件就是整个程序。`lens_harness/dsl.py` 把
+spec 编译成普通的 `StateGraph`——trace、checkpoint、lens、diff 全部照旧，编排只是
+一个新入口，不是新内核。
+
+```bash
+python3 -m lens_harness run --graph examples/calc-agent.json \
+    --input '{"question":"What is 17*23?","messages":[],"tools_used":[],"answer":"","steps":0}'
+```
+
+spec 结构（完整示例见 `examples/calc-agent.json`、`examples/approval-flow.json`）：
+
+| 字段 | 说明 |
+|---|---|
+| `state` | 通道声明：`"名字": "类型"` 或 `["类型", "reducer"]`，reducer ∈ `add / add_unique / merge_dict / overwrite` |
+| `nodes` | 四种节点：`llm`（一轮模型调用，`system` 提示词 + `max_steps` 步数上限）、`tool_loop`（执行上一条助手消息里的 `TOOL: name \| arg`）、`interrupt`（人工审批点，`resume_into` 指定恢复后进入的节点）、`python`（`fn: "module:func"`） |
+| `tools` | 工具注册表：`builtin:calculator`、`builtin:word_count` 或 `python:module:func` |
+| `edges` | `"节点": "目标"` 静态边，或 `{"condition": "tool_call" 或 "python:mod:fn", "then": {key: 目标}}` 条件边；`"__end__"` 结束 |
+| `entry` | 入口节点 |
+| `llm` | `"spec": "mock"` 或内联脚本 `"replies": [...]` / `"script": [{"contains":..., "reply":...}]`——离线可复现 |
+
+错误处理：任何 spec 问题（未知类型/未声明的边目标/无法导入的 `module:func`）都会抛
+`SpecError`，消息里带出错的 JSON 路径（如 `edges.a.then.tools: target node 'ghost' is not declared`），
+绝不静默降级。路由函数返回未声明的 key 同样在运行期报错并打印两边的候选。
+
+已知限制：节点类型固定为上述四种（写路径扩展需先改 DESIGN §10）；`llm` 的消息格式
+固定为 `TOOL: name | arg` / `FINAL:`（与 `examples/agent.py` 相同的线协议）。
 
 ## trace 对比（M3）
 

@@ -767,6 +767,16 @@ self.emitter.emit(
 - **仍然不做**：两个以上的 trace。对比是两两关系；N 份 trace 的「聚类」是另一个工具。
 - **仍然不做**：多 trace 的实时 follow 对比。两份都在写的 trace 无法定义「对齐到哪一刻」。
 
+### 编排入口的边界（DSL 之后收窄）
+
+这条**曾隐含「编排只能写 Python」**。JSON DSL（`dsl.py` + `run --graph`）落地后重新划界：
+
+- **做了**：一个**声明式编排入口**——JSON spec 编译成普通的 `StateGraph`，节点模板固定四种（`llm` / `tool_loop` / `interrupt` / `python`），路由条件是内置两种（`tool_call` / `always`）或 `python:module:func` 引用。编译后的图与手写的图**不可区分**：同一内核、同一事件契约、同一 trace/diff 路径。spec 错误一律 `SpecError` 带 JSON 路径，不静默降级。
+- **仍然不做**：可视化拖拽编排器（浏览器仍是只读 lens，见上）。
+- **仍然不做**：插件/注册表式的节点类型扩展——四种写死了；加新类型要改 `dsl.py`，这属于内核演进而非编排行为。
+- **仍然不做**：YAML 或其它格式——保持零依赖（原则一）。JSON 够表达图结构；`pyyaml` 的依赖代价买不来新能力。
+- **仍然不做**：在 spec 里内嵌任意代码——`python` 节点与条件必须是可导入的 `module:func` 引用，代码在仓库里、可 review、可测。内嵌代码字符串会让「编排文件」变成「藏起来的程序」，trace 也无法对它负责。
+
 ### 不做流式的 state 输出
 
 只有 `node_token` 这一种流（token 级）。没有「每一步的状态增量推给客户端」的通道——要看状态就读 `state_merge` 事件。
@@ -1159,6 +1169,7 @@ py -3.13 -m tests.test_kernel
 py -3.13 -m tests.test_flows
 py -3.13 -m tests.test_serve
 py -3.13 -m tests.test_compare
+py -3.13 -m tests.test_dsl
 
 # 渲染一份现有 trace
 py -3.13 -m lens_harness show traces/r_70b323a6.jsonl

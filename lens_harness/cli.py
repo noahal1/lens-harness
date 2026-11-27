@@ -190,7 +190,25 @@ def cmd_diff(args: argparse.Namespace) -> int:
 
 
 def cmd_run(args: argparse.Namespace) -> int:
-    """Import ``module:attr`` and call it to get the events of one run."""
+    """Import ``module:attr`` and call it to get the events of one run.
+
+    ``--graph <spec.json>`` switches to the DSL path: the JSON file *is* the
+    program, compiled by :mod:`lens_harness.dsl` into the ordinary StateGraph.
+    """
+    if getattr(args, "graph", None):
+        from .dsl import run_spec
+
+        events = run_spec(
+            args.graph,
+            json.loads(args.input) if args.input else {},
+            trace_dir=args.trace_dir,
+            llm_spec=args.llm,
+        )
+        print(render_events(events, options=RenderOptions(show_tokens=not args.no_tokens)))
+        return 0
+
+    if not args.target:
+        raise SystemExit("pass a target like 'examples.agent:build', or --graph <spec.json>")
     target = args.target
     if ":" not in target:
         raise SystemExit("target must look like 'module.submodule:attribute'")
@@ -313,7 +331,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_run = sub.add_parser("run", help="run an example that returns events")
     _add_color_flag(p_run)
-    p_run.add_argument("target")
+    p_run.add_argument("target", nargs="?", default=None,
+                       help="module:attr (not needed with --graph)")
+    p_run.add_argument("--graph", default=None,
+                       help="a JSON graph spec: the file is the program")
     p_run.add_argument("--input", default="{}")
     p_run.add_argument("--trace-dir", default="traces")
     p_run.add_argument("--llm", default=None, help="mock | auto | openai:<model>")

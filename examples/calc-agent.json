@@ -1,0 +1,30 @@
+{
+  "name": "calc-agent",
+  "state": {
+    "question": "str",
+    "messages": ["list[dict[str, str]]", "add"],
+    "tools_used": ["list[str]", "add_unique"],
+    "answer": "str",
+    "steps": "int"
+  },
+  "llm": {
+    "replies": [
+      "Let me compute that. TOOL: calculator | 17*23",
+      "Now the word count. TOOL: word_count | the quick brown fox jumps",
+      "FINAL: 17*23 is 391, and the sentence has 5 words."
+    ]
+  },
+  "tools": {
+    "calculator": "builtin:calculator",
+    "word_count": "builtin:word_count"
+  },
+  "nodes": {
+    "agent": {"type": "llm", "system": "You compute things. Call a tool or answer FINAL.", "max_steps": 4},
+    "tools": {"type": "tool_loop"}
+  },
+  "entry": "agent",
+  "edges": {
+    "agent": {"condition": "tool_call", "then": {"tools": "tools", "end": "__end__"}},
+    "tools": "agent"
+  }
+}
