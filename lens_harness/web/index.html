@@ -1,0 +1,1297 @@
+<!DOCTYPE html>
+<!--
+  lens — the web view of a trace.
+
+  THIS FILE IS A PURE FUNCTION OF THE EVENT STREAM. It knows nothing about
+  graphs, nodes, reducers or the runtime; every pixel it draws is derived from
+  the `lens` events arriving from /events (which are byte-identical to the
+  lines of the .jsonl trace file). Nothing here can influence a run.
+
+  Design, top to bottom:
+    derive(events, upto)  -> view model        (pure, no DOM, no globals)
+    paint()               -> view model -> DOM (the only impure part)
+
+  `upto` is an index into the received events, so scrubbing backwards is not an
+  "undo": the view model is simply recomputed from the event prefix. That is the
+  whole point of the architecture — state at step k is a function of the trace
+  up to k, so replay needs no LLM and no checkpoints.
+-->
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>lens</title>
+<style>
+  :root {
+    --bg: #0b0e13;
+    --panel: #11151c;
+    --panel-2: #151b24;
+    --line: #1f2833;
+    --line-2: #2b3644;
+    --ink: #dbe3ec;
+    --ink-2: #9aa7b6;
+    --ink-3: #6b7889;
+    --accent: #57c7b0;
+    --accent-2: #2a6b60;
+    --warn: #e0a83c;
+    --bad: #e8695f;
+    --info: #6aa8e0;
+    --violet: #9a86e8;
+    --pink: #cf8ad0;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--ink);
+    font: 13px/1.5 var(--sans);
+    display: grid;
+    grid-template-rows: auto minmax(0, 1fr) auto;
+    height: 100vh;
+    overflow: hidden;
+    -webkit-font-smoothing: antialiased;
+  }
+  code, kbd, pre, .mono { font-family: var(--mono); font-variant-ligatures: none; }
+
+  /* ---------- header ---------- */
+  header {
+    display: flex; align-items: center; gap: 14px;
+    padding: 9px 16px;
+    border-bottom: 1px solid var(--line);
+    background: linear-gradient(180deg, #12171f, #0e131a);
+    min-height: 46px;
+  }
+  .brand {
+    font-family: var(--mono); font-size: 15px; letter-spacing: .12em;
+    color: var(--accent); font-weight: 600;
+  }
+  .brand::before {
+    content: ""; display: inline-block; width: 9px; height: 9px; margin-right: 9px;
+    border-radius: 50%; vertical-align: 1px;
+    background: radial-gradient(circle at 35% 30%, #9ff0df, var(--accent) 55%, #1d5a50);
+    box-shadow: 0 0 10px rgba(87,199,176,.55);
+  }
+  .sep { width: 1px; height: 18px; background: var(--line-2); }
+  .gname { font-family: var(--mono); color: var(--ink); font-size: 13px; }
+  .meta { color: var(--ink-3); font-family: var(--mono); font-size: 12px; }
+  .spacer { flex: 1; }
+  .chip {
+    font-family: var(--mono); font-size: 11px; letter-spacing: .04em;
+    padding: 2px 8px; border-radius: 999px;
+    border: 1px solid var(--line-2); color: var(--ink-2);
+    background: #0d1218; white-space: nowrap;
+  }
+  .chip[data-status="running"]   { color: var(--accent); border-color: var(--accent-2); background: rgba(87,199,176,.09); }
+  .chip[data-status="complete"]  { color: var(--accent); border-color: var(--accent-2); background: rgba(87,199,176,.09); }
+  .chip[data-status="interrupted"]{ color: var(--warn); border-color: #6b5321; background: rgba(224,168,60,.1); }
+  /* The kernel's own vocabulary is "failed" (checkpoint.STATUS_FAILED); "error"
+     is what this page shows while a node_error has landed but run_end has not.
+     Both must be red, or a genuinely failed run renders as an unstyled chip. */
+  .chip[data-status="failed"],
+  .chip[data-status="error"]     { color: var(--bad); border-color: #6e2f2b; background: rgba(232,105,95,.1); }
+  .chip[data-status="resumed"]   { color: var(--accent); border-color: var(--accent-2); background: rgba(87,199,176,.09); }
+  .chip[data-status="waiting"]   { color: var(--ink-3); }
+  #conn[data-live="1"] { color: var(--accent); border-color: var(--accent-2); }
+  #conn[data-live="0"] { color: var(--ink-3); }
+  #conn[data-live="err"] { color: var(--bad); border-color: #6e2f2b; }
+  .dot { display:inline-block; width:6px;height:6px;border-radius:50%;background:currentColor;margin-right:5px;vertical-align:0; }
+  #conn[data-live="1"] .dot { animation: pulse 1.6s ease-in-out infinite; }
+  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.25} }
+
+  /* ---------- main ---------- */
+  main {
+    display: grid;
+    grid-template-columns: minmax(0, 1.12fr) minmax(380px, 0.88fr);
+    min-height: 0;
+  }
+  .panel { display: flex; flex-direction: column; min-height: 0; min-width: 0; }
+  .panel + .panel { border-left: 1px solid var(--line); }
+  .panel-head {
+    display: flex; align-items: center; gap: 10px;
+    padding: 7px 14px; border-bottom: 1px solid var(--line);
+    font-family: var(--mono); font-size: 11px; letter-spacing: .1em;
+    text-transform: uppercase; color: var(--ink-3);
+    background: #0e131a;
+    flex: 0 0 auto;
+  }
+  .panel-head .right { margin-left: auto; letter-spacing: 0; text-transform: none; }
+
+  /* ---------- graph ---------- */
+  /* The diagram scales down to fit the panel, but only to a legibility floor
+     (72%); below that the panel scrolls instead of shrinking further. A
+     five-rank graph is ~1170px wide; squeezing that into a ~700px panel is a
+     0.6x scale, which takes 12.5px node labels to ~7px -- unreadable. `--gnw`
+     is the natural width in px, set by buildGraph(). `margin:auto` centres the
+     SVG when it fits and collapses to 0 when it does not, so an oversized
+     graph scrolls from its top-left corner rather than being clipped on one
+     side (the classic `justify-content:center` bug in a scroll container). */
+  #graphWrap { flex: 1 1 auto; min-height: 0; position: relative; overflow: auto; padding: 14px;
+               display: flex; }
+  #graph { display: block; margin: auto; flex: 0 0 auto; height: auto;
+           width: min(100%, var(--gnw, 100%));
+           min-width: calc(var(--gnw, 0px) * 0.72); }
+  #graphNote { text-transform: none; letter-spacing: 0; }
+  .edge path { fill: none; stroke: var(--line-2); stroke-width: 1.5; }
+  .edge.cond path { stroke-dasharray: 5 4; }
+  .edge.taken path { stroke: #3c6b62; }
+  .edge.hot path { stroke: var(--accent); stroke-width: 2.2; stroke-dasharray: none; filter: drop-shadow(0 0 4px rgba(87,199,176,.45)); }
+  text.elabel { fill: var(--ink-3); font-family: var(--mono); font-size: 10px; text-anchor: middle; }
+  text.elabel.taken { fill: #7fb3a8; }
+  text.elabel.hot { fill: var(--accent); }
+  .node rect.box {
+    fill: #131920; stroke: var(--line-2); stroke-width: 1.4; rx: 7;
+  }
+  .node text.nm { fill: var(--ink); font-family: var(--mono); font-size: 12.5px; font-weight: 600; }
+  .node text.tg { fill: var(--ink-3); font-family: var(--mono); font-size: 9.5px; letter-spacing: .06em; }
+  .node .badge circle { fill: #0f141a; stroke: var(--line-2); }
+  .node .badge text { fill: var(--ink-2); font-family: var(--mono); font-size: 9px; text-anchor: middle; }
+  .node.done rect.box { stroke: #2f4a44; }
+  .node.visited rect.box { fill: #141c22; }
+  .node.active rect.box {
+    fill: #16211f; stroke: var(--accent); stroke-width: 2;
+    filter: drop-shadow(0 0 9px rgba(87,199,176,.35));
+  }
+  .node.active text.nm { fill: #eafff9; }
+  .node.active .ring { opacity: 1; }
+  .node .ring {
+    fill: none; stroke: var(--accent); stroke-width: 1.2; opacity: 0;
+    animation: ring 1.5s ease-out infinite;
+  }
+  @keyframes ring { 0% { opacity: .7; transform: scale(1); } 100% { opacity: 0; transform: scale(1.09); } }
+  .node.terminal rect.box { fill: #10151b; stroke-dasharray: 3 3; }
+  .node.terminal text.nm { fill: var(--ink-3); }
+  .node.errored rect.box { stroke: var(--bad); stroke-width: 2; }
+  #legend {
+    flex: 0 0 auto; display: flex; flex-wrap: wrap; gap: 12px;
+    padding: 7px 14px; border-top: 1px solid var(--line);
+    font-family: var(--mono); font-size: 10.5px; color: var(--ink-3);
+  }
+  #legend i { display: inline-block; width: 8px; height: 8px; border-radius: 2px; margin-right: 5px; vertical-align: 0; }
+  #legend .lg-taken { color: #7fb3a8; }
+
+  /* ---------- inspector ---------- */
+  .tabs { display: flex; gap: 2px; padding: 6px 10px 0; border-bottom: 1px solid var(--line); background: #0e131a; flex: 0 0 auto; }
+  .tab {
+    appearance: none; background: none; border: 0; border-bottom: 2px solid transparent;
+    color: var(--ink-3); font-family: var(--mono); font-size: 11px; letter-spacing: .07em;
+    padding: 6px 10px 7px; cursor: pointer; text-transform: uppercase;
+  }
+  .tab:hover { color: var(--ink-2); }
+  .tab[aria-selected="true"] { color: var(--accent); border-bottom-color: var(--accent); }
+  .tab .n { color: var(--ink-3); margin-left: 5px; }
+  #inspector { flex: 1 1 auto; min-height: 0; overflow: auto; padding: 12px 14px 20px; }
+  .pane { display: none; }
+  .pane.on { display: block; }
+  .empty { color: var(--ink-3); font-family: var(--mono); font-size: 12px; padding: 14px 2px; }
+  .dim { color: var(--ink-3); }
+  h4 {
+    margin: 16px 0 7px; font-family: var(--mono); font-size: 10.5px; font-weight: 600;
+    letter-spacing: .12em; text-transform: uppercase; color: var(--ink-3);
+  }
+  h4:first-child { margin-top: 2px; }
+  .kv { display: grid; grid-template-columns: minmax(90px, 32%) minmax(0, 1fr); gap: 2px 10px; }
+  .kv .k { font-family: var(--mono); font-size: 12px; color: var(--info); overflow: hidden; text-overflow: ellipsis; }
+  .kv .k.changed { color: var(--warn); }
+  .kv .k.changed::after { content: " ●"; font-size: 8px; vertical-align: 2px; }
+  .kv .v { font-family: var(--mono); font-size: 12px; color: var(--ink-2); word-break: break-word; white-space: pre-wrap; }
+  pre.blk {
+    margin: 0; padding: 9px 10px; background: #0d1218; border: 1px solid var(--line);
+    border-radius: 6px; font-size: 11.5px; color: var(--ink-2); overflow: auto; max-height: 320px;
+    white-space: pre-wrap; word-break: break-word;
+  }
+  .j-k { color: var(--info); } .j-s { color: #a9d18e; } .j-n { color: var(--warn); } .j-l { color: var(--violet); }
+  .drow { border: 1px solid var(--line); border-radius: 7px; margin-bottom: 8px; overflow: hidden; }
+  .drow .dh {
+    display: flex; align-items: center; gap: 8px; padding: 5px 10px;
+    background: #0f141a; border-bottom: 1px solid var(--line);
+    font-family: var(--mono); font-size: 11.5px; color: var(--ink);
+  }
+  .drow .dh .red { color: var(--ink-3); font-size: 10px; }
+  .ba { display: grid; grid-template-columns: 1fr 1fr; }
+  .ba > div { padding: 7px 10px; font-family: var(--mono); font-size: 11.5px; white-space: pre-wrap; word-break: break-word; min-width: 0; }
+  .ba > div:first-child { border-right: 1px solid var(--line); color: #a08a8a; background: rgba(232,105,95,.035); }
+  .ba > div:last-child { color: #a2bda9; background: rgba(87,199,176,.035); }
+  .ba .lbl { display: block; font-size: 9.5px; letter-spacing: .1em; color: var(--ink-3); margin-bottom: 3px; }
+  .ba .same { color: var(--ink-3); }
+
+  .evlist { display: flex; flex-direction: column; gap: 1px; }
+  .evrow {
+    display: grid; grid-template-columns: 38px 132px minmax(0, 1fr); gap: 8px;
+    padding: 3px 7px; border-radius: 4px; cursor: pointer;
+    font-family: var(--mono); font-size: 11.5px; align-items: baseline;
+  }
+  .evrow:hover { background: #161d26; }
+  .evrow .sq { color: var(--ink-3); text-align: right; }
+  .evrow .kd { color: var(--ink-2); }
+  .evrow .sm { color: var(--ink-3); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .evrow.future { opacity: .34; }
+  .evrow.cur { background: #17242a; box-shadow: inset 2px 0 0 var(--accent); }
+  .evrow.cur .sm { color: var(--ink-2); }
+  .evrow[data-kind="node_end"] .kd,
+  .evrow[data-kind="state_merge"] .kd { color: var(--accent); }
+  .evrow[data-kind="route_decision"] .kd { color: var(--info); }
+  .evrow[data-kind="checkpoint_created"] .kd { color: var(--violet); }
+  .evrow[data-kind="interrupt"] .kd { color: var(--warn); }
+  .evrow[data-kind="node_error"] .kd { color: var(--bad); }
+  .evrow[data-kind="node_token"] .kd { color: var(--ink-3); }
+
+  .cp { border-left: 2px solid var(--line-2); padding: 5px 0 5px 12px; margin-left: 3px; position: relative; }
+  .cp::before {
+    content: ""; position: absolute; left: -5px; top: 11px; width: 8px; height: 8px;
+    border-radius: 50%; background: #0b0e13; border: 1.5px solid var(--line-2);
+  }
+  .cp[data-status="complete"]::before { border-color: var(--accent); background: var(--accent); }
+  .cp[data-status="interrupted"]::before { border-color: var(--warn); background: var(--warn); }
+  .cp[data-status="failed"]::before { border-color: var(--bad); background: var(--bad); }
+  .cp .cid { font-family: var(--mono); font-size: 11.5px; color: var(--ink); }
+  .cp .cmeta { font-family: var(--mono); font-size: 10.5px; color: var(--ink-3); }
+
+  .banner {
+    display: flex; gap: 9px; padding: 9px 11px; border-radius: 7px; margin-bottom: 10px;
+    font-family: var(--mono); font-size: 11.5px; line-height: 1.45;
+    border: 1px solid #6b5321; background: rgba(224,168,60,.08); color: #e8c98a;
+  }
+  .banner.err { border-color: #6e2f2b; background: rgba(232,105,95,.08); color: #f0a39c; }
+  .banner .ic { flex: 0 0 auto; }
+
+  /* ---------- timeline ---------- */
+  footer {
+    border-top: 1px solid var(--line);
+    background: #0e131a;
+    padding: 8px 16px 10px;
+    display: grid; gap: 8px;
+    flex: 0 0 auto;
+  }
+  .steps { display: flex; gap: 6px; flex-wrap: wrap; align-items: stretch; }
+  .step {
+    display: flex; flex-direction: column; gap: 1px; min-width: 74px;
+    padding: 4px 9px; border-radius: 6px; cursor: pointer;
+    border: 1px solid var(--line); background: #0d1218;
+    font-family: var(--mono); font-size: 10.5px; color: var(--ink-3);
+    transition: border-color .12s, color .12s, background .12s;
+  }
+  .step:hover { border-color: var(--line-2); }
+  .step .si { font-size: 9.5px; letter-spacing: .08em; opacity: .8; }
+  .step .sn { color: var(--ink-2); font-size: 11px; }
+  .step.done { border-color: #26403a; }
+  .step.done .si { color: var(--accent); }
+  .step.cur { border-color: var(--accent); background: rgba(87,199,176,.1); }
+  .step.cur .sn { color: #d9fff6; }
+  .step.future { opacity: .4; }
+  .step.intr { border-color: #6b5321; background: rgba(224,168,60,.07); }
+  .step.intr .si { color: var(--warn); }
+
+  .scrub { display: flex; align-items: center; gap: 12px; }
+  .ctl {
+    appearance: none; border: 1px solid var(--line-2); background: #0d1218; color: var(--ink-2);
+    border-radius: 6px; width: 28px; height: 26px; cursor: pointer; font-size: 11px;
+    display: inline-flex; align-items: center; justify-content: center; padding: 0;
+    font-family: var(--mono); flex: 0 0 auto;
+  }
+  .ctl:hover { color: var(--ink); border-color: #3a4859; }
+  .ctl.on { color: var(--accent); border-color: var(--accent-2); background: rgba(87,199,176,.1); }
+  input[type=range] {
+    appearance: none; -webkit-appearance: none; flex: 1 1 auto; height: 22px; background: transparent; margin: 0;
+  }
+  input[type=range]::-webkit-slider-runnable-track {
+    height: 4px; border-radius: 2px;
+    background: linear-gradient(90deg, var(--accent-2) 0 var(--pct, 0%), #1d2631 var(--pct, 0%) 100%);
+  }
+  input[type=range]::-webkit-slider-thumb {
+    -webkit-appearance: none; width: 13px; height: 13px; border-radius: 50%;
+    background: var(--accent); border: 2px solid #0b0e13; margin-top: -4.5px;
+    box-shadow: 0 0 0 1px var(--accent-2); cursor: grab;
+  }
+  input[type=range]::-moz-range-track { height: 4px; border-radius: 2px; background: #1d2631; }
+  input[type=range]::-moz-range-progress { height: 4px; border-radius: 2px; background: var(--accent-2); }
+  input[type=range]::-moz-range-thumb {
+    width: 11px; height: 11px; border-radius: 50%; background: var(--accent);
+    border: 2px solid #0b0e13; cursor: grab;
+  }
+  .pos { font-family: var(--mono); font-size: 11px; color: var(--ink-3); white-space: nowrap; flex: 0 0 auto; }
+  .pos b { color: var(--ink); font-weight: 500; }
+  .hint { font-family: var(--mono); font-size: 10.5px; color: var(--ink-3); opacity: .8; }
+  kbd {
+    font-family: var(--mono); font-size: 10px; padding: 0 4px; border-radius: 3px;
+    border: 1px solid var(--line-2); background: #131a22; color: var(--ink-2);
+  }
+  ::-webkit-scrollbar { width: 10px; height: 10px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background: #202a36; border-radius: 5px; border: 2px solid var(--bg); }
+  ::-webkit-scrollbar-thumb:hover { background: #2c3846; }
+</style>
+
+<header>
+  <span class="brand">lens</span>
+  <span class="sep"></span>
+  <span class="gname" id="gname">—</span>
+  <span class="meta" id="runmeta"></span>
+  <span class="spacer"></span>
+  <span class="chip" id="conn"><span class="dot"></span><span id="connTxt">connecting</span></span>
+  <span class="chip" data-status="waiting" id="status">waiting</span>
+  <span class="chip" id="count">0 events</span>
+</header>
+
+<main>
+  <section class="panel">
+    <div class="panel-head">
+      <span>graph</span>
+      <span class="right" id="graphNote">waiting for run_start…</span>
+    </div>
+    <div id="graphWrap"><svg id="graph" preserveAspectRatio="xMidYMid meet"></svg></div>
+    <div id="legend"></div>
+  </section>
+
+  <section class="panel">
+    <div class="panel-head">
+      <span>inspector</span>
+      <span class="right" id="inspectorNote"></span>
+    </div>
+    <div class="tabs" role="tablist">
+      <button class="tab" role="tab" data-tab="state"   aria-selected="true">state</button>
+      <button class="tab" role="tab" data-tab="diff"    aria-selected="false">diff</button>
+      <button class="tab" role="tab" data-tab="writes"  aria-selected="false">writes</button>
+      <button class="tab" role="tab" data-tab="events"  aria-selected="false">events<span class="n" id="evN"></span></button>
+      <button class="tab" role="tab" data-tab="cps"     aria-selected="false">checkpoints</button>
+    </div>
+    <div id="inspector">
+      <div id="banners"></div>
+      <div class="pane on" data-pane="state"><div class="empty">no state yet</div></div>
+      <div class="pane" data-pane="diff"></div>
+      <div class="pane" data-pane="writes"></div>
+      <div class="pane" data-pane="events"><div class="evlist" id="evlist"></div></div>
+      <div class="pane" data-pane="cps"><div id="cplist"><div class="empty">no checkpoints yet</div></div></div>
+    </div>
+  </section>
+</main>
+
+<footer>
+  <div class="steps" id="steps"></div>
+  <div class="scrub">
+    <button class="ctl" id="prev" title="previous event (←)">◀</button>
+    <button class="ctl" id="play" title="play / pause (space)">▶</button>
+    <button class="ctl" id="next" title="next event (→)">▶</button>
+    <input type="range" id="range" min="0" max="0" value="0" aria-label="scrub events">
+    <span class="pos" id="pos"></span>
+    <button class="ctl" id="live" title="follow the tip (l)">live</button>
+  </div>
+  <div class="hint">
+    <kbd>←</kbd><kbd>→</kbd> step &nbsp; <kbd>space</kbd> play &nbsp; <kbd>l</kbd> follow tip
+    &nbsp;·&nbsp; everything below is a pure function of the event prefix
+  </div>
+</footer>
+
+<div id="fatal" hidden></div>
+
+<script>
+(function () {
+  "use strict";
+
+  /* ==================================================================== *
+   *  1. derive(): events + cursor -> view model.  Pure. No DOM access.
+   * ==================================================================== */
+
+  var TERMINAL = "__end__";
+
+  /* The writes pane shows a token preview, so there is no reason to hold an
+     unbounded transcript in memory. 400 chunks is far past what fits on screen. */
+  var TOKEN_CAP = 400;
+
+  /* A conditional edge's ``candidates`` are what the ROUTER RETURNS, not node
+     names. Two generations of snapshots exist and the page must read both:
+
+       * newer: ``mapping`` = {candidate: node} and ``descriptions`` = prose;
+       * older: no ``mapping``, and ``descriptions`` holds the node name.
+
+     Getting this wrong is not cosmetic: resolving to prose makes the graph edge
+     point at a node that does not exist, so the edge vanishes and the target
+     node loses its rank. Hence one resolver used by *every* caller. */
+  function candTarget(ce, key) {
+    if (ce.mapping && ce.mapping[key] !== undefined) return ce.mapping[key];
+    if (ce.descriptions && ce.descriptions[key] !== undefined) return ce.descriptions[key];
+    return key;
+  }
+
+  /* The prose, when the snapshot actually carries prose (i.e. ``mapping`` exists
+     and the description differs from the node name). Used for edge tooltips. */
+  function candProse(ce, key) {
+    var d = ce.descriptions && ce.descriptions[key];
+    if (!d) return "";
+    return d === candTarget(ce, key) ? "" : d;
+  }
+
+  function successors(graph, src) {
+    var out = [], i;
+    for (i = 0; i < (graph.edges || []).length; i++)
+      if (graph.edges[i].source === src) out.push(graph.edges[i].target);
+    for (i = 0; i < (graph.conditional_edges || []).length; i++) {
+      var ce = graph.conditional_edges[i];
+      if (ce.source !== src) continue;
+      for (var j = 0; j < (ce.candidates || []).length; j++)
+        out.push(candTarget(ce, ce.candidates[j]));
+    }
+    return out;
+  }
+
+  /* Left-to-right ranks by BFS from the entry; cycles become back-edges, which
+     is exactly how you want to draw a tool loop. */
+  function layout(graph) {
+    var ranks = {}, order = [], q = [], i;
+    var names = (graph.nodes || []).map(function (n) { return n.name; });
+    var entry = graph.entry || names[0];
+
+    if (entry) { ranks[entry] = 0; q.push(entry); order.push(entry); }
+    while (q.length) {
+      var cur = q.shift(), r = ranks[cur];
+      var succ = successors(graph, cur);
+      for (i = 0; i < succ.length; i++) {
+        var t = succ[i];
+        if (t === TERMINAL || ranks[t] !== undefined) continue;
+        ranks[t] = r + 1; q.push(t); order.push(t);
+      }
+    }
+    var maxR = -1;
+    for (var k in ranks) if (ranks[k] > maxR) maxR = ranks[k];
+    for (i = 0; i < names.length; i++)
+      if (ranks[names[i]] === undefined) { ranks[names[i]] = maxR + 1; order.push(names[i]); }
+
+    var byRank = {};
+    for (i = 0; i < order.length; i++) {
+      var n = order[i];
+      (byRank[ranks[n]] = byRank[ranks[n]] || []).push(n);
+    }
+    var hasEnd = false;
+    for (i = 0; i < (graph.edges || []).length; i++)
+      if (graph.edges[i].target === TERMINAL) hasEnd = true;
+    for (i = 0; i < (graph.conditional_edges || []).length; i++) {
+      var ceo = graph.conditional_edges[i];
+      var cds = ceo.candidates || [];
+      for (var kc = 0; kc < cds.length; kc++)
+        if (candTarget(ceo, cds[kc]) === TERMINAL) hasEnd = true;
+    }
+
+    /* Vertical padding is asymmetric on purpose: back-edges arc over the top and
+       rank-skipping edges arc under the bottom, so both need their own room. */
+    var W = 156, H = 58, GX = 104, GY = 54, PADX = 26, PADTOP = 72, PADBOT = 64;
+    var pos = {}, maxX = 0, maxY = 0;
+    Object.keys(byRank).forEach(function (rk) {
+      var list = byRank[rk];
+      list.forEach(function (nm, idx) {
+        var x = PADX + Number(rk) * (W + GX);
+        var y = PADTOP + idx * (H + GY);
+        pos[nm] = { x: x, y: y, w: W, h: H, rank: Number(rk) };
+        if (x + W > maxX) maxX = x + W;
+        if (y + H > maxY) maxY = y + H;
+      });
+    });
+    if (hasEnd) {
+      pos[TERMINAL] = { x: maxX + GX, y: PADTOP, w: 78, h: 44, rank: maxR + 2, terminal: true };
+      maxX += GX + 78;
+      if (PADTOP + 44 > maxY) maxY = PADTOP + 44;
+    }
+    return { pos: pos, order: order, w: maxX + PADX, h: maxY + PADBOT,
+             W: W, H: H, top: PADTOP, bottom: maxY };
+  }
+
+  function derive(events, upto) {
+    var vm = {
+      graph: null, runId: null, threadId: null, config: {},
+      status: "waiting", runEnd: null, runEndSeq: -1,
+      steps: {}, stepOrder: [], currentSuperstep: -1,
+      nodeStatus: {}, visits: {}, running: {}, errored: {},
+      tokens: {}, tokenDropped: {}, writes: {}, durations: {},
+      state: null, diff: null, patches: null, changed: [], lastMerge: null,
+      edgeUse: {}, lastEdges: [],
+      routes: [], cpById: {}, cpOrder: [], interrupts: [], errors: [],
+      lay: null, lastSeq: -1, nApplied: 0,
+    };
+
+    for (var i = 0; i <= upto && i < events.length; i++) apply(vm, events[i]);
+    return vm;
+  }
+
+  function apply(vm, ev) {
+    var d = ev.data || {};
+    vm.lastSeq = ev.seq;
+    vm.nApplied += 1;
+
+    switch (ev.kind) {
+      case "run_start":
+        vm.graph = d.graph || null;
+        vm.runId = ev.run_id; vm.threadId = ev.thread_id;
+        vm.config = d.config || {};
+        vm.state = d.inputs || {};
+        vm.status = "running";
+        if (vm.graph) vm.lay = layout(vm.graph);
+        break;
+
+      case "superstep_start":
+        if (vm.runEnd && ev.seq > vm.runEndSeq) vm.status = "running"; // trace continues after an interrupt/finish
+        vm.steps[d.index] = { index: d.index, nodes: d.nodes || [], done: false, interrupted: false, seq: ev.seq };
+        if (vm.stepOrder.indexOf(d.index) < 0) vm.stepOrder.push(d.index);
+        vm.stepOrder.sort(function (a, b) { return a - b; });
+        vm.currentSuperstep = d.index;
+        for (var s = 0; s < (d.nodes || []).length; s++) {
+          vm.running[d.nodes[s]] = true;
+          vm.nodeStatus[d.nodes[s]] = "active";
+        }
+        break;
+
+      case "node_start":
+        vm.nodeStatus[d.node] = "active";
+        vm.running[d.node] = true;
+        vm.visits[d.node] = (vm.visits[d.node] || 0) + 1;
+        vm.tokens[d.node] = [];
+        /* A step chip should land ON the step's work, not on the superstep_start
+           bookkeeping frame one event earlier. Record the first node_start. */
+        var sst = vm.steps[ev.superstep];
+        if (sst && sst.nodeSeq === undefined) sst.nodeSeq = ev.seq;
+        break;
+
+      case "node_token":
+        /* Tokens are kept per node for the writes pane only. The list is capped:
+           a chatty model streams thousands of chunks and the pane shows a preview,
+           so growing an array without bound (and re-joining it on every repaint)
+           buys nothing. The tail is counted instead of silently dropped. */
+        var arr = vm.tokens[d.node] || (vm.tokens[d.node] = []);
+        if (arr.length < TOKEN_CAP) arr.push(d.token);
+        else vm.tokenDropped[d.node] = (vm.tokenDropped[d.node] || 0) + 1;
+        break;
+
+      case "node_end":
+        vm.nodeStatus[d.node] = "done";
+        delete vm.running[d.node];
+        vm.writes[d.node] = d.writes || {};
+        vm.durations[d.node] = d.duration_ms;
+        break;
+
+      case "state_merge":
+        vm.state = d.state || vm.state;
+        vm.diff = d.diff || null;
+        vm.patches = d.patches || {};
+        vm.changed = d.changed_channels || [];
+        vm.lastMerge = { seq: ev.seq, superstep: ev.superstep };
+        break;
+
+      case "route_decision": {
+        var targets = Array.isArray(d.returned) ? d.returned : [d.returned];
+        var conds = (vm.graph && vm.graph.conditional_edges) || [];
+        var ce = null;
+        for (var c = 0; c < conds.length; c++)
+          if (conds[c].source === d.source && conds[c].router === d.condition) ce = conds[c];
+        vm.lastEdges = [];   /* "hot" = routed by the latest decision only */
+        for (var t = 0; t < targets.length; t++) {
+          var raw = targets[t];
+          var to = (ce && candTarget(ce, raw)) || raw;
+          var key = d.source + "->" + to;
+          vm.edgeUse[key] = (vm.edgeUse[key] || 0) + 1;
+          vm.lastEdges.push(key);
+        }
+        vm.routes.push({ src: d.source, cond: d.condition, ret: d.returned, cands: d.candidates });
+        break;
+      }
+
+      case "checkpoint_created": {
+        var seen = vm.cpById[d.checkpoint_id];
+        if (!seen) vm.cpOrder.push(d.checkpoint_id);
+        /* ``superstep`` is not in EVENT_SCHEMA[CHECKPOINT_CREATED] — the schema only
+           requires id/parent/next/status. The kernel does send it, but a trace from
+           anywhere else need not, and rendering "ss undefined" is not an option:
+           fall back to the seq's own superstep, which is always present. */
+        vm.cpById[d.checkpoint_id] = {
+          id: d.checkpoint_id, parent: d.parent_id, status: d.status,
+          next: d.next_nodes,
+          superstep: d.superstep !== undefined ? d.superstep : ev.superstep,
+          seq: ev.seq,
+        };
+        break;
+      }
+
+      case "interrupt":
+        vm.interrupts.push({
+          node: d.node, payload: d.payload, checkpoint: d.checkpoint_id,
+          schema: d.resume_schema, seq: ev.seq, superstep: ev.superstep,
+        });
+        vm.status = "interrupted";
+        if (vm.steps[ev.superstep]) vm.steps[ev.superstep].interrupted = true;
+        break;
+
+      case "node_error":
+        vm.errors.push({ node: d.node, error: d.error, seq: ev.seq });
+        vm.errored[d.node] = true;
+        vm.status = "error";
+        break;
+
+      case "run_end":
+        vm.status = d.status || "complete";
+        vm.runEnd = d; vm.runEndSeq = ev.seq;
+        for (var r in vm.running) vm.nodeStatus[r] = "done";
+        vm.running = {};
+        for (var k in vm.steps) vm.steps[k].done = true;
+        break;
+    }
+  }
+
+  /* ==================================================================== *
+   *  2. paint(): view model -> DOM.  The only impure part of the file.
+   * ==================================================================== */
+
+  var $ = function (sel) { return document.querySelector(sel); };
+  var S = { events: [], upto: -1, wantTip: true, playing: false, tab: "state",
+            mode: "…", built: false, sig: "", timer: null };
+
+  function esc(s) {
+    return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+  }
+
+  function colorize(text) {
+    return esc(text).replace(
+      /("(?:[^"\\]|\\.)*")(\s*:)?|\b(true|false|null)\b|(-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)/g,
+      function (m, str, colon, lit, num) {
+        if (str) return colon ? '<span class="j-k">' + str + "</span>" + colon : '<span class="j-s">' + str + "</span>";
+        if (lit) return '<span class="j-l">' + lit + "</span>";
+        if (num) return '<span class="j-n">' + num + "</span>";
+        return m;
+      }
+    );
+  }
+
+  function pretty(v) {
+    try { return JSON.stringify(v, null, 2); } catch (e) { return String(v); }
+  }
+
+  function compact(v, max) {
+    var s;
+    if (typeof v === "string") s = JSON.stringify(v);
+    else { try { s = JSON.stringify(v); } catch (e) { s = String(v); } }
+    if (s === undefined) s = "undefined";
+    max = max || 220;
+    return s.length > max ? s.slice(0, max) + " …(" + (s.length - max) + " more)" : s;
+  }
+
+  function fmtMs(ms) {
+    if (typeof ms !== "number") return "—";
+    if (ms < 1) return ms.toFixed(2) + " ms";
+    if (ms < 1000) return ms.toFixed(1) + " ms";
+    return (ms / 1000).toFixed(2) + " s";
+  }
+
+  /* ---- header ---- */
+  function paintHeader(vm, total) {
+    $("#gname").textContent = (vm.graph && vm.graph.name) || "—";
+    $("#runmeta").textContent = vm.runId ? vm.runId + " · " + (vm.threadId || "default") : "";
+    var st = $("#status");
+    st.textContent = vm.status;
+    st.setAttribute("data-status", vm.status);
+    $("#count").textContent = vm.nApplied + " / " + total + " events";
+  }
+
+  /* ---- graph ---- */
+  function nodeClass(name, vm) {
+    var cls = "node";
+    var tag = "";
+    if (vm.graph) {
+      for (var i = 0; i < vm.graph.nodes.length; i++)
+        if (vm.graph.nodes[i].name === name) tag = (vm.graph.nodes[i].tags || [])[0] || "";
+    }
+    if (name === TERMINAL) cls += " terminal";
+    if (vm.errored[name]) cls += " errored";
+    if (vm.nodeStatus[name] === "active") cls += " active";
+    else if (vm.nodeStatus[name] === "done") cls += " done";
+    if (vm.visits[name]) cls += " visited";
+    return { cls: cls, tag: tag };
+  }
+
+  var TAG_COLOR = {
+    llm: "#6aa8e0", "side-effect": "#e0a83c", human: "#cf8ad0",
+    policy: "#9a86e8", router: "#57c7b0",
+  };
+
+  function buildGraph(vm) {
+    var lay = vm.lay, g = vm.graph;
+    S.built = true;
+    S.sig = JSON.stringify(g);
+
+    var svg = $("#graph");
+    svg.setAttribute("viewBox", "0 0 " + lay.w + " " + lay.h);
+    // Size comes from CSS (scale down to a legibility floor, then scroll).
+    // The viewBox gives the SVG its intrinsic aspect ratio, so height:auto
+    // tracks whatever width the panel allows. --gnw is the natural width.
+    svg.removeAttribute("width");
+    svg.removeAttribute("height");
+    svg.style.setProperty("--gnw", lay.w + "px");
+    var out = [];
+
+    out.push('<defs>');
+    ["", "taken", "hot"].forEach(function (st) {
+      var col = st === "hot" ? "#57c7b0" : st === "taken" ? "#3c6b62" : "#2b3644";
+      out.push('<marker id="arw-' + (st || "idle") + '" viewBox="0 0 10 10" refX="9" refY="5" ' +
+               'markerWidth="6" markerHeight="6" orient="auto-start-reverse">' +
+               '<path d="M0,0 L10,5 L0,10 z" fill="' + col + '"/></marker>');
+    });
+    out.push('</defs>');
+
+    /* edges: paths underneath the node boxes, labels above them */
+    var edges = [];
+    (g.edges || []).forEach(function (e) { edges.push({ s: e.source, t: e.target, cond: false, label: "" }); });
+    (g.conditional_edges || []).forEach(function (ce) {
+      (ce.candidates || []).forEach(function (key) {
+        edges.push({
+          s: ce.source, t: candTarget(ce, key), cond: true,
+          label: key, router: ce.router, prose: candProse(ce, key),
+        });
+      });
+    });
+
+    /* ---- edge routing -------------------------------------------------
+       Three things would collide with naive centre-to-centre lines, and all
+       three happen in the demo graph:
+
+         * a reciprocal pair (agent <-> tools) draws two identical lines;
+         * a rank-skipping edge (agent -> __end__) cuts through the boxes of
+           the ranks it skips;
+         * two edges leaving one node ("tools" and "__end__") start from the
+           same point.
+
+       So: forward edges that reach the very next rank go straight; forward
+       edges that skip ranks arc below the row; everything going backwards (or
+       staying on the same rank) arcs above it. Each edge then leaves and enters
+       on a perpendicular face, so no two share a line. */
+    var drops = [];
+    edges.forEach(function (e) {
+      if (!lay.pos[e.s] || !lay.pos[e.t]) return;
+      var a = lay.pos[e.s], b = lay.pos[e.t];
+      var acx = a.x + a.w / 2, acy = a.y + a.h / 2;
+      var bcx = b.x + b.w / 2, bcy = b.y + b.h / 2;
+      var d, mx, my;
+
+      if (e.s === e.t) {
+        /* self loop: up and over its own box */
+        var lx = a.x + a.w * 0.34, rx = a.x + a.w * 0.66;
+        d = "M" + lx + "," + a.y + " C" + (lx - 14) + "," + (a.y - 40) + " " +
+            (rx + 14) + "," + (a.y - 40) + " " + rx + "," + a.y;
+        mx = acx; my = a.y - 34;
+      } else if (b.x >= a.x + a.w) {
+        /* Forward edge. Whether it may run straight is a question about
+           GEOMETRY, not about rank numbers: the END box is drawn on the top row
+           at the far right, so its rank (maxR+2) wildly overstates how far it
+           really is. Judging by rank made `explode -> END` dive under the whole
+           diagram even though nothing at all sat between the two boxes.
+           So: straight through the corridor unless some third box is actually
+           in the way. */
+        var blocker = null;
+        for (var nk in lay.pos) {
+          if (nk === e.s || nk === e.t) continue;
+          var p = lay.pos[nk];
+          if (p.x + p.w <= a.x + a.w + 1) continue;   // ends left of our right face
+          if (p.x >= b.x - 1) continue;               // starts right of their left face
+          var lo = Math.min(acy, bcy) - 4, hi = Math.max(acy, bcy) + 4;
+          if (p.y + p.h > lo && p.y < hi) { blocker = p; break; }
+        }
+        if (!blocker) {
+          /* adjacent ranks: a clean horizontal run, arrow into the left face */
+          var y1 = acy, y2 = bcy;
+          d = "M" + (a.x + a.w) + "," + y1 + " C" + (a.x + a.w + 46) + "," + y1 + " " +
+              (b.x - 46) + "," + y2 + " " + b.x + "," + y2;
+          mx = (a.x + a.w + b.x) / 2; my = (y1 + y2) / 2 - 9;
+        } else {
+          /* something sits between: dive under the intervening row */
+          var ay = a.y + a.h, by = b.y + b.h;
+          var nadir = lay.bottom + 30 + Math.abs(acx - bcx) * 0.04;
+          d = "M" + acx + "," + ay + " C" + acx + "," + nadir + " " + bcx + "," + nadir + " " + bcx + "," + by;
+          mx = (acx + bcx) / 2; my = nadir - 12;
+        }
+      } else {
+        /* backwards (a loop) or sideways: arc over the top, arrow into the top face */
+        var top = lay.top - 26 - Math.abs(acx - bcx) * 0.035;
+        d = "M" + acx + "," + a.y + " C" + acx + "," + top + " " + bcx + "," + top + " " + bcx + "," + b.y;
+        mx = (acx + bcx) / 2; my = top + 12;
+      }
+      drops.push({ key: e.s + "->" + e.t, cond: e.cond, label: e.label,
+                   prose: e.prose || "", d: d, mx: mx, my: my });
+    });
+
+    drops.forEach(function (e) {
+      out.push('<g class="edge' + (e.cond ? " cond" : "") + '" data-edge="' + esc(e.key) + '">' +
+               (e.prose ? "<title>" + esc(e.label + " — " + e.prose) + "</title>" : "") +
+               '<path d="' + e.d + '" marker-end="url(#arw-idle)"/></g>');
+    });
+
+    /* nodes */
+    (lay.order || []).forEach(function (name) {
+      var p = lay.pos[name];
+      if (!p) return;
+      var nc = nodeClass(name, vm);
+      var tagCol = TAG_COLOR[nc.tag] || "#6b7889";
+      out.push('<g class="' + nc.cls + '" data-node="' + esc(name) + '">');
+      out.push('<rect class="ring" x="' + (p.x - 4) + '" y="' + (p.y - 4) + '" width="' + (p.w + 8) +
+               '" height="' + (p.h + 8) + '" rx="10"/>');
+      out.push('<rect class="box" x="' + p.x + '" y="' + p.y + '" width="' + p.w + '" height="' + p.h +
+               '" rx="7" style="stroke:' + tagCol + '55"/>');
+      out.push('<rect x="' + p.x + '" y="' + p.y + '" width="3.5" height="' + p.h + '" rx="1.75" fill="' + tagCol + '"/>');
+      out.push('<text class="nm" x="' + (p.x + 14) + '" y="' + (p.y + 25) + '">' + esc(name === TERMINAL ? "END" : name) + '</text>');
+      var sub = nc.tag || (name === TERMINAL ? "terminal" : "");
+      if (sub) out.push('<text class="tg" x="' + (p.x + 14) + '" y="' + (p.y + 42) + '">' + esc(sub) + '</text>');
+      out.push('<g class="badge" data-badge="' + esc(name) + '" opacity="0">' +
+               '<circle cx="' + (p.x + p.w - 14) + '" cy="' + (p.y + 14) + '" r="9"/>' +
+               '<text x="' + (p.x + p.w - 14) + '" y="' + (p.y + 17) + '">0</text></g>');
+      out.push('</g>');
+    });
+
+    if (lay.pos[TERMINAL]) {
+      var tp = lay.pos[TERMINAL];
+      out.push('<g class="node terminal" data-node="' + TERMINAL + '">' +
+               '<rect class="box" x="' + tp.x + '" y="' + tp.y + '" width="' + tp.w + '" height="' + tp.h + '" rx="7"/>' +
+               '<text class="nm" x="' + (tp.x + tp.w / 2) + '" y="' + (tp.y + 27) + '" text-anchor="middle">END</text></g>');
+    }
+
+    drops.forEach(function (e) {
+      out.push('<text class="elabel" data-lbl="' + esc(e.key) + '" data-base="' + esc(e.label) + '" x="' +
+               e.mx + '" y="' + e.my + '">' + esc(e.label) + "</text>");
+    });
+
+    svg.innerHTML = out.join("");
+
+    var lg = ['<span><i style="background:#6aa8e0"></i>llm</span>',
+              '<span><i style="background:#e0a83c"></i>side-effect</span>',
+              '<span><i style="background:#cf8ad0"></i>human</span>',
+              '<span><i style="background:#9a86e8"></i>policy</span>',
+              '<span class="lg-taken">— — conditional edge</span>'];
+    $("#legend").innerHTML = lg.join("");
+    $("#graphNote").textContent = (g.nodes || []).length + " nodes · " + (g.channels || []).length + " channels";
+  }
+
+  var HOT_EDGES = {};
+
+  function updateGraph(vm) {
+    var svg = $("#graph");
+    var nodes = svg.querySelectorAll("g.node");
+    for (var i = 0; i < nodes.length; i++) {
+      var el = nodes[i], name = el.getAttribute("data-node");
+      var nc = nodeClass(name, vm);
+      el.setAttribute("class", nc.cls);
+      var b = el.querySelector('[data-badge]');
+      if (b) {
+        var n = vm.visits[name] || 0;
+        b.setAttribute("opacity", n ? "1" : "0");
+        var tx = b.querySelector("text");
+        if (tx) tx.textContent = String(n);
+      }
+    }
+    var edges = svg.querySelectorAll("g.edge");
+    for (var j = 0; j < edges.length; j++) {
+      var ge = edges[j], key = ge.getAttribute("data-edge");
+      var used = vm.edgeUse[key] || 0;
+      var cls = "edge" + (ge.classList.contains("cond") ? " cond" : "");
+      if (used) cls += " taken";
+      if (HOT_EDGES[key]) cls += " hot";
+      ge.setAttribute("class", cls);
+      var pth = ge.querySelector("path");
+      if (pth) pth.setAttribute("marker-end", "url(#arw-" + (HOT_EDGES[key] ? "hot" : used ? "taken" : "idle") + ")");
+    }
+    var labels = svg.querySelectorAll("text.elabel");
+    for (var q = 0; q < labels.length; q++) {
+      var lt = labels[q], lk = lt.getAttribute("data-lbl");
+      var base = lt.getAttribute("data-base") || "";
+      var uses = vm.edgeUse[lk] || 0;
+      var lcls = "";
+      if (uses) lcls = "taken";
+      if (HOT_EDGES[lk]) lcls = "hot";
+      lt.setAttribute("class", "elabel" + (lcls ? " " + lcls : ""));
+      lt.textContent = uses ? (base ? base + " ×" + uses : "×" + uses) : base;
+    }
+  }
+
+  /* ---- timeline ---- */
+  function paintSteps(vm, upto) {
+    var host = $("#steps");
+    if (!vm.stepOrder.length) { host.innerHTML = ""; return; }
+    var html = [];
+    vm.stepOrder.forEach(function (idx) {
+      var st = vm.steps[idx];
+      var cls = "step";
+      if (st.interrupted) cls += " intr";
+      if (idx === vm.currentSuperstep) cls += " cur";
+      else if (idx < vm.currentSuperstep || st.done) cls += " done";
+      if (idx > vm.currentSuperstep && !st.done && idx !== vm.currentSuperstep) cls += " future";
+      html.push('<div class="' + cls + '" data-step="' + idx + '" data-seq="' + (st.nodeSeq !== undefined ? st.nodeSeq : (st.seq || 0)) + '" title="jump to superstep ' +
+                idx + '">' +
+                '<span class="si">ss ' + idx + "</span>" +
+                '<span class="sn">' + esc(st.nodes.join(" + ") || "—") + "</span></div>");
+    });
+    host.innerHTML = html.join("");
+  }
+
+  /* ---- inspector ---- */
+  function paneState(vm) {
+    var host = document.querySelector('[data-pane="state"]');
+    if (!vm.state || !Object.keys(vm.state).length) {
+      host.innerHTML = '<div class="empty">no state yet — waiting for run_start / state_merge</div>';
+      return;
+    }
+    var keys = Object.keys(vm.state);
+    /* The heading names the seq the state was REDUCED at, not the seq the cursor
+       sits on. Those differ: cursor 48 is run_end, while the last state_merge is
+       earlier. paneDiff already reports vm.lastMerge.seq, so the two panes agree. */
+    var at = vm.lastMerge ? vm.lastMerge.seq : vm.lastSeq;
+    var html = ["<h4>channels at seq " + at + "</h4>", '<div class="kv">'];
+    keys.forEach(function (k) {
+      var ch = vm.changed.indexOf(k) >= 0;
+      html.push('<div class="k' + (ch ? " changed" : "") + '">' + esc(k) + "</div>");
+      html.push('<div class="v">' + colorize(compact(vm.state[k], 400)) + "</div>");
+    });
+    html.push("</div>");
+    html.push("<h4>full state</h4><pre class=\"blk\">" + colorize(pretty(vm.state)) + "</pre>");
+    host.innerHTML = html.join("");
+  }
+
+  function paneDiff(vm) {
+    var host = document.querySelector('[data-pane="diff"]');
+    if (!vm.diff) {
+      host.innerHTML = '<div class="empty">no state_merge at or before this point — nothing has been reduced yet</div>';
+      return;
+    }
+    var html = [];
+    html.push('<h4>reducer output of superstep ' + (vm.lastMerge ? vm.lastMerge.superstep : "?") +
+              " (event seq " + (vm.lastMerge ? vm.lastMerge.seq : "?") + ")</h4>");
+    var chans = Object.keys(vm.diff);
+    if (!chans.length) html.push('<div class="empty">state_merge with no changed channels</div>');
+    chans.forEach(function (c) {
+      var d = vm.diff[c] || {};
+      html.push('<div class="drow"><div class="dh"><span>' + esc(c) + '</span>' +
+                '<span class="red">' + (vm.changed.indexOf(c) >= 0 ? "reduced" : "") + "</span></div>");
+      html.push('<div class="ba">');
+      /* ``before``/``after`` are not schema-guaranteed either; JSON.stringify(undefined)
+         yields the string "undefined", which would read like a real value. */
+      html.push('<div><span class="lbl">BEFORE</span>' +
+                ("before" in d ? colorize(compact(d.before)) : '<span class="dim">—</span>') + "</div>");
+      html.push('<div><span class="lbl">AFTER</span>' +
+                ("after" in d ? colorize(compact(d.after)) : '<span class="dim">—</span>') + "</div>");
+      html.push("</div></div>");
+    });
+    html.push("<h4>raw patches from this superstep</h4><pre class=\"blk\">" + colorize(pretty(vm.patches || {})) + "</pre>");
+    host.innerHTML = html.join("");
+  }
+
+  function paneWrites(vm) {
+    var host = document.querySelector('[data-pane="writes"]');
+    var st = vm.steps[vm.currentSuperstep];
+    if (!st) { host.innerHTML = '<div class="empty">no superstep yet</div>'; return; }
+    var html = ['<h4>superstep ' + st.index + " · node writes, before the reducer</h4>"];
+    var any = false;
+    st.nodes.forEach(function (n) {
+      if (!(n in vm.writes)) return;
+      any = true;
+      html.push('<div class="drow"><div class="dh"><span>' + esc(n) + "</span>" +
+                '<span class="red">' + fmtMs(vm.durations[n]) + "</span></div>" +
+                '<pre class="blk" style="border:0;border-radius:0;background:transparent">' +
+                colorize(pretty(vm.writes[n])) + "</pre></div>");
+    });
+    if (!any) html.push('<div class="empty">no node has finished in this superstep yet</div>');
+    /* Tokens are per node, not per superstep, and the map is never cleared, so
+       iterating all of it would print nodes from earlier supersteps under this
+       superstep's heading. Only show the nodes that are running *now*. */
+    var toks = (st.nodes || []).filter(function (n) {
+      return vm.tokens[n] && vm.tokens[n].length;
+    });
+    if (toks.length) {
+      html.push("<h4>streamed tokens</h4>");
+      toks.forEach(function (n) {
+        var rest = vm.tokenDropped[n];
+        html.push('<div class="kv"><div class="k">' + esc(n) + '</div><div class="v">' +
+                  esc(vm.tokens[n].join("")) +
+                  (rest ? ' <span class="red">…(' + rest + " more chunks)</span>" : "") +
+                  "</div></div>");
+      });
+    }
+    host.innerHTML = html.join("");
+  }
+
+  function evSummary(ev) {
+    var d = ev.data || {};
+    switch (ev.kind) {
+      case "run_start":
+        return (d.graph && d.graph.name ? d.graph.name : "?") + " · entry " + (d.graph ? d.graph.entry : "?");
+      case "superstep_start": return "#" + d.index + " → " + (d.nodes || []).join(", ");
+      case "node_start": return d.node;
+      case "node_token": return d.node + ": " + JSON.stringify(d.token);
+      case "node_end":
+        return d.node + " · " + fmtMs(d.duration_ms) + " · wrote " + (Object.keys(d.writes || {}).join(",") || "—");
+      case "state_merge": return "changed " + ((d.changed_channels || []).join(", ") || "—");
+      case "route_decision":
+        return d.source + " → " + (Array.isArray(d.returned) ? d.returned.join("|") : d.returned) +
+               (d.condition ? " (" + d.condition + ")" : " (static)");
+      case "checkpoint_created": return d.checkpoint_id + " · " + d.status;
+      case "interrupt": return d.node + " · waiting for a human";
+      case "node_error": return d.node + ": " + d.error;
+      case "run_end": return d.status + " · " + d.supersteps + " supersteps";
+      default: return "";
+    }
+  }
+
+  function paintEvents(vm, upto) {
+    var host = $("#evlist");
+    var html = [];
+    for (var i = 0; i < S.events.length; i++) {
+      var ev = S.events[i];
+      var cls = "evrow";
+      if (i > upto) cls += " future";
+      if (i === upto) cls += " cur";
+      html.push('<div class="' + cls + '" data-i="' + i + '" data-kind="' + ev.kind + '">' +
+                '<span class="sq">' + ev.seq + "</span>" +
+                '<span class="kd">' + esc(ev.kind) + "</span>" +
+                '<span class="sm">' + esc(evSummary(ev)) + "</span></div>");
+    }
+    host.innerHTML = html.join("");
+    $("#evN").textContent = S.events.length ? String(S.events.length) : "";
+    if (upto >= 0) {
+      var cur = host.querySelector(".evrow.cur");
+      if (cur) cur.scrollIntoView({ block: "nearest" });
+    }
+  }
+
+  function paintCps(vm) {
+    var host = $("#cplist");
+    if (!vm.cpOrder.length) { host.innerHTML = '<div class="empty">no checkpoints yet</div>'; return; }
+    var html = [];
+    vm.cpOrder.forEach(function (id) {
+      var c = vm.cpById[id];
+      html.push('<div class="cp" data-status="' + esc(c.status) + '">' +
+                '<div class="cid">' + esc(c.id) + "</div>" +
+                '<div class="cmeta">ss ' + c.superstep + " · " + esc(c.status) +
+                " · next " + esc((c.next || []).join(", ") || "—") +
+                (c.parent ? "<br>parent " + esc(c.parent) : "") + "</div></div>");
+    });
+    host.innerHTML = html.join("");
+  }
+
+  function paintInspector(vm) {
+    /* A banner must never outlive the status it describes. The interrupt banner
+       is only true while the run is *still* interrupted: the approval trace
+       resumes after seq 14, and at the tip its status is "complete", so showing
+       "interrupted at request_approval" there would contradict the status chip
+       in the header. Same for the error banner once a later run_end has spoken. */
+    var intr = "";
+    if (vm.interrupts.length && vm.status === "interrupted") {
+      var it = vm.interrupts[vm.interrupts.length - 1];
+      intr = '<div class="banner"><span class="ic">⏸</span><div><b>interrupted</b> at node <b>' + esc(it.node) +
+             "</b> · checkpoint " + esc(it.checkpoint || "?") +
+             '<pre class="blk" style="margin-top:6px">' + colorize(pretty(it.payload)) + "</pre></div></div>";
+    }
+    var errs = "";
+    if (vm.errors.length && (vm.status === "error" || vm.status === "failed")) {
+      var er = vm.errors[vm.errors.length - 1];
+      errs = '<div class="banner err"><span class="ic">✖</span><div>node <b>' + esc(er.node) + "</b> failed: " +
+             esc(er.error) + "</div></div>";
+    }
+    var banner = intr + errs;
+    $("#banners").innerHTML = banner;
+
+    paneState(vm); paneDiff(vm); paneWrites(vm); paintCps(vm); paintEvents(vm, S.upto);
+
+    $("#inspectorNote").textContent = vm.lastMerge
+      ? "reduced at seq " + vm.lastMerge.seq
+      : (vm.graph ? "waiting for a superstep" : "waiting for run_start…");
+  }
+
+  function paintCursor(vm) {
+    var total = S.events.length;
+    var range = $("#range");
+    range.max = Math.max(0, total - 1);
+    range.value = Math.max(0, S.upto);
+    var pct = total > 1 ? (S.upto / (total - 1)) * 100 : 0;
+    range.style.setProperty("--pct", pct + "%");
+    var seq = S.upto >= 0 && S.events[S.upto] ? S.events[S.upto].seq : -1;
+    $("#pos").innerHTML = "seq <b>" + seq + "</b> / " + (total ? S.events[total - 1].seq : "–") +
+      (S.wantTip ? ' <span style="color:var(--accent)">live</span>' : "");
+    $("#play").classList.toggle("on", S.playing);
+    $("#play").textContent = S.playing ? "❚❚" : "▶";
+    $("#live").classList.toggle("on", S.wantTip);
+  }
+
+  var pending = false;
+  function paint() {
+    if (pending) return;
+    pending = true;
+    requestAnimationFrame(function () {
+      pending = false;
+      var vm = derive(S.events, S.upto);
+      paintHeader(vm, S.events.length);
+      hotEdgesFrom(vm);
+      if (vm.graph) {
+        var sig = JSON.stringify(vm.graph);
+        if (!S.built || S.sig !== sig) buildGraph(vm);
+        updateGraph(vm);
+      }
+      paintSteps(vm, S.upto);
+      paintInspector(vm);
+      paintCursor(vm);
+    });
+  }
+
+  function hotEdgesFrom(vm) {
+    HOT_EDGES = {};
+    if (!vm.lastEdges.length) return;
+    for (var i = 0; i < vm.lastEdges.length; i++) HOT_EDGES[vm.lastEdges[i]] = true;
+  }
+
+  /* ==================================================================== *
+   *  3. cursor + transport
+   * ==================================================================== */
+
+  function goTo(idx, follow) {
+    S.upto = Math.max(-1, Math.min(S.events.length - 1, idx));
+    S.wantTip = !!follow;
+    paint();
+  }
+
+  function toTip() {
+    S.upto = S.events.length - 1;
+    S.wantTip = true;
+    paint();
+  }
+
+  function push(ev) {
+    /* A trace that was rerun under us restarts its seq numbering at 0. The
+       event list is indexed by position but labelled by seq, so appending a
+       second run would show duplicate ids and desynchronise the scrubber from
+       its own label. Seeing a seq we already passed is the signal, and the
+       right response is to start the model over: the page is a pure function
+       of the event prefix, so "forget and replay" is always correct. */
+    if (S.events.length && ev.seq <= S.events[S.events.length - 1].seq) {
+      S.events = [];
+      S.upto = -1;
+      S.built = false;
+      S.sig = "";
+    }
+    S.events.push(ev);
+    if (S.wantTip) { S.upto = S.events.length - 1; }
+    paint();
+  }
+
+  function setConn(state, text) {
+    $("#conn").setAttribute("data-live", state);
+    $("#connTxt").textContent = text;
+  }
+
+  function connect(after) {
+    var url = "/events" + (after >= 0 ? "?after=" + after : "");
+    if (!window.EventSource) {
+      setConn("err", "no EventSource");
+      return;
+    }
+    var es = new EventSource(url);
+
+    es.addEventListener("meta", function (e) {
+      var m = JSON.parse(e.data);
+      S.mode = m.mode;
+      setConn("1", m.mode === "follow" ? "following" : "replay");
+    });
+
+    es.addEventListener("lens", function (e) {
+      var ev = JSON.parse(e.data);
+      /* keep the model consistent with the ticker: the cursor follows the tip
+         unless the user has scrubbed back. */
+      push(ev);
+    });
+
+    es.addEventListener("done", function () {
+      setConn("0", "replay complete");
+      es.close();
+    });
+
+    es.addEventListener("error", function (e) {
+      if (e.data) {
+        setConn("err", "stream error");
+        var pane = document.querySelector('[data-pane="' + S.tab + '"]');
+        if (pane) pane.insertAdjacentHTML("afterbegin",
+          '<div class="banner err"><span class="ic">⚠</span><div>' + esc(e.data) + "</div></div>");
+      } else if (es.readyState === 2) {
+        setConn("err", "disconnected");
+      } else {
+        setConn("1", "reconnecting…");
+      }
+    });
+  }
+
+  /* ---- controls ---- */
+  function wire() {
+    document.querySelectorAll(".tab").forEach(function (b) {
+      b.addEventListener("click", function () {
+        document.querySelectorAll(".tab").forEach(function (x) { x.setAttribute("aria-selected", "false"); });
+        b.setAttribute("aria-selected", "true");
+        document.querySelectorAll(".pane").forEach(function (p) {
+          p.classList.toggle("on", p.getAttribute("data-pane") === b.getAttribute("data-tab"));
+        });
+        S.tab = b.getAttribute("data-tab");
+        paint();
+      });
+    });
+
+    $("#range").addEventListener("input", function (e) {
+      S.playing = false;
+      goTo(Number(e.target.value), Number(e.target.value) >= S.events.length - 1);
+    });
+    $("#prev").addEventListener("click", function () { S.playing = false; goTo(S.upto - 1, false); });
+    $("#next").addEventListener("click", function () {
+      S.playing = false;
+      if (S.upto >= S.events.length - 1) toTip(); else goTo(S.upto + 1, false);
+    });
+    $("#live").addEventListener("click", function () { S.playing = false; toTip(); });
+    $("#play").addEventListener("click", function () { togglePlay(); });
+
+    $("#steps").addEventListener("click", function (e) {
+      var el = e.target.closest("[data-step]");
+      if (!el) return;
+      S.playing = false;
+      goTo(Number(el.getAttribute("data-seq")), false);
+    });
+    $("#evlist").addEventListener("click", function (e) {
+      var el = e.target.closest("[data-i]");
+      if (!el) return;
+      S.playing = false;
+      var i = Number(el.getAttribute("data-i"));
+      goTo(i, i === S.events.length - 1);
+    });
+
+    document.addEventListener("keydown", function (e) {
+      if (e.target.tagName === "INPUT") return;
+      if (e.key === "ArrowLeft") { e.preventDefault(); S.playing = false; goTo(S.upto - 1, false); }
+      else if (e.key === "ArrowRight") { e.preventDefault(); S.playing = false; goTo(S.upto + 1, false); }
+      else if (e.key === " ") { e.preventDefault(); togglePlay(); }
+      else if (e.key === "l" || e.key === "L") { S.playing = false; toTip(); }
+      else if (e.key === "Home") { S.playing = false; goTo(0, false); }
+      else if (e.key === "End") { S.playing = false; toTip(); }
+    });
+  }
+
+  function togglePlay() {
+    S.playing = !S.playing;
+    if (S.timer) { clearInterval(S.timer); S.timer = null; }
+    if (S.playing) {
+      S.wantTip = false;
+      if (S.upto >= S.events.length - 1) S.upto = -1;
+      S.timer = setInterval(function () {
+        if (S.upto >= S.events.length - 1) { S.playing = false; clearInterval(S.timer); S.timer = null; paint(); return; }
+        S.upto += 1;
+        paint();
+      }, 90);
+    }
+    paint();
+  }
+
+  /* ---- boot ----
+     Always start from seq 0, deliberately. The page is a *pure function of the
+     event prefix* (see derive()), so the graph, the superstep timeline and every
+     checkpoint are built while replaying that prefix. Starting from a mid-trace
+     resume point (``?after=40``) would skip run_start and therefore leave the
+     page with no graph and one checkpoint — structurally broken, not merely
+     incomplete. Resume across a *reconnect* is a different thing and is handled
+     by the browser itself: EventSource resends ``Last-Event-ID``, so the server
+     continues where the socket died without the page asking for it. */
+  wire();
+  paint();
+  connect(-1);
+})();
+</script>

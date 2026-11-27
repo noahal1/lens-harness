@@ -1,0 +1,23 @@
+# Trace output — regenerated every run, one file per run.
+traces/*
+# ...but keep the handful the docs cite as evidence, so a fresh clone can
+# reproduce the exact output printed in README.md / DESIGN.md.
+!traces/r_70b323a6.jsonl
+!traces/r_a0567c7f.jsonl
+!traces/r_c22281d6.jsonl
+
+# Test scratch space. Tests create case-* dirs here because the OS temp dir is
+# outside the workspace and the sandbox refuses it.
+.test-tmp/
+.lens-test-tmp/
+
+# Probe / verification scratch from development sessions.
+.probe_*/
+.verify_*/
+.cite*.py
+.remap.py
+.probe_fixes.py
+
+# Python
+__pycache__/
+*.py[cod]
